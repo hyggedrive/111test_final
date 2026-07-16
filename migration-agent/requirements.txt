@@ -1,0 +1,6 @@
+clang
+colorama
+Pygments
+Requests
+termcolor
+demjson3

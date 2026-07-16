@@ -1,0 +1,15 @@
+set(LLVM_LINK_COMPONENTS
+  TransformUtils
+  BitWriter
+  Core
+  IRReader
+  Support
+  Passes
+  )
+
+add_llvm_tool(llvm-split
+  llvm-split.cpp
+
+  DEPENDS
+  intrinsics_gen
+  )

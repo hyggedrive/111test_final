@@ -1,0 +1,17 @@
+.git/
+__pycache__/
+*.vscode/
+
+*.out
+*.o
+*.log
+test
+tmp*/
+*_llmRepaired.*
+
+build/
+dist/
+bishengai.spec
+run_test_cases.sh
+
+
