@@ -2747,7 +2747,8 @@ enum class RISCVFunctionSplitBlockReason {
   Count,
 };
 
-static StringRef toString(RISCVFunctionSplitBlockReason r) {
+//static StringRef toString(RISCVFunctionSplitBlockReason r) {
+static StringRef blockReasonToString(RISCVFunctionSplitBlockReason r) {
   switch (r) {
   case RISCVFunctionSplitBlockReason::UnsupportedSection:
     return "unsupported-section";
@@ -2857,11 +2858,11 @@ static bool isAllZero(ArrayRef<uint8_t> data) {
 
 static bool isRISCVNopPadding(ArrayRef<uint8_t> data) {
   for (size_t i = 0, e = data.size(); i != e;) {
-    if (i + 4 <= e && read32le(data.data() + i) == 0x00000013) {
+    if (i + 4 <= e && llvm::support::endian::read32le(data.data() + i) == 0x00000013) {
       i += 4;
       continue;
     }
-    if (i + 2 <= e && read16le(data.data() + i) == 0x0001) {
+    if (i + 2 <= e && llvm::support::endian::read16le(data.data() + i) == 0x0001) {
       i += 2;
       continue;
     }
@@ -3031,8 +3032,8 @@ static void auditSourceRelocs(InputSection &sec,
       bool validCallPair = func != -1 && rangeInOnePiece(ranges, off, off + 8);
       if (validCallPair) {
         ArrayRef<uint8_t> data = sec.content();
-        uint32_t auipc = read32le(data.data() + off);
-        uint32_t jalr = read32le(data.data() + off + 4);
+        uint32_t auipc = llvm::support::endian::read32le(data.data() + off);
+        uint32_t jalr = llvm::support::endian::read32le(data.data() + off + 4);
         uint32_t auipcRd = bits(auipc, 11, 7);
         uint32_t jalrRd = bits(jalr, 11, 7);
         uint32_t jalrRs1 = bits(jalr, 19, 15);
@@ -3078,7 +3079,7 @@ static void auditSourceRelocs(InputSection &sec,
         addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
         break;
       }
-      uint16_t half = read16le(data.data() + off);
+      uint16_t half = llvm::support::endian::read16le(data.data() + off);
       if ((half & 3) != 3) {
         if (!rvc)
           addReason(result,
@@ -3122,11 +3123,11 @@ static void auditSourceRelocs(InputSection &sec,
         addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
         break;
       }
-      uint32_t insn = read32le(data.data() + off);
+      uint32_t insn = llvm::support::endian::read32le(data.data() + off);
       uint32_t opcode = insn & 0x7f;
       bool terminal = false;
       if (opcode == 0x17 && off + 4 < r.end) {
-        uint32_t next = read32le(data.data() + off + 4);
+        uint32_t next = llvm::support::endian::read32le(data.data() + off + 4);
         if ((next & 0x7f) == 0x67 &&
             (llvm::is_contained(typesAtOffset.lookup(off),
                                 static_cast<RelType>(R_RISCV_CALL)) ||
@@ -3395,11 +3396,17 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
                               RISCVFunctionSplitBlockReason::Count);
          ++i)
       if (r.reasons.test(i))
-        reasons.push_back(toString(static_cast<RISCVFunctionSplitBlockReason>(
-            i)));
+    	reasons.push_back(blockReasonToString(
+    static_cast<RISCVFunctionSplitBlockReason>(i)));
     llvm::sort(reasons);
-    message(Twine("riscv-function-sections-split: block reasons: ") +
-            llvm::join(reasons.begin(), reasons.end(), ","));
+    /*message(Twine("riscv-function-sections-split: block reasons: ") +
+            llvm::join(reasons.begin(), reasons.end(), ","));*/
+    if (reasons.empty()) {
+	message("riscv-function-sections-split: block reasons: none");
+    } else {
+  	message(Twine("riscv-function-sections-split: block reasons: ") +
+          llvm::join(reasons.begin(), reasons.end(), ","));
+    }
     candidateBytes += r.candidateFunctionBytes;
     functionRanges += r.functionCount;
     if (r.safe) {
@@ -3427,7 +3434,7 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   for (size_t i = 0; i != reasonCounts.size(); ++i)
     if (reasonCounts[i])
       message(Twine("riscv-function-sections-split: summary: ") +
-              toString(static_cast<RISCVFunctionSplitBlockReason>(i)) + ": " +
+              blockReasonToString(static_cast<RISCVFunctionSplitBlockReason>(i)) + ": " +
               Twine(reasonCounts[i]));
 }
 } // namespace
