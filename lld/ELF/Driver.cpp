@@ -46,6 +46,7 @@
 #include "lld/Common/Strings.h"
 #include "lld/Common/TargetOptionsCommandFlags.h"
 #include "lld/Common/Version.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -2811,6 +2812,7 @@ struct RISCVFunctionRange {
 
 struct RISCVFunctionSplitAuditResult {
   InputSection *parent = nullptr;
+  SmallVector<RISCVFunctionRange, 0> ranges;
   uint64_t executableBytes = 0;
   uint64_t candidateFunctionBytes = 0;
   uint64_t gapBytes = 0;
@@ -2821,6 +2823,24 @@ struct RISCVFunctionSplitAuditResult {
   bool safe = true;
   std::bitset<static_cast<size_t>(RISCVFunctionSplitBlockReason::Count)>
       reasons;
+};
+
+struct RISCVFunctionSplitDetail {
+  InputSection *parent = nullptr;
+  SmallVector<RISCVFunctionRange, 0> ranges;
+  SmallVector<SmallVector<uint64_t, 0>, 0> childRelocOffsets;
+  uint32_t relocationCount = 0;
+};
+
+struct RISCVFunctionSplitStats {
+  uint32_t splitParentCount = 0;
+  uint32_t skippedSafeSingleFunctionParentCount = 0;
+  uint32_t createdChildCount = 0;
+  uint32_t symbolRebindCount = 0;
+  uint32_t relocationRepartitionCount = 0;
+  uint32_t parentFallbackCount = 0;
+  uint64_t splitBytes = 0;
+  SmallVector<RISCVFunctionSplitDetail, 0> details;
 };
 
 static void addReason(RISCVFunctionSplitAuditResult &r,
@@ -2850,6 +2870,20 @@ static bool rangeInOnePiece(ArrayRef<RISCVFunctionRange> ranges, uint64_t begin,
     return rangeIndex(ranges, begin) != -1;
   int i = rangeIndex(ranges, begin);
   return i != -1 && end <= ranges[i].end;
+}
+
+static bool isRISCVFunctionSplitBoundary(ArrayRef<RISCVFunctionRange> ranges,
+                                         uint64_t off) {
+  for (size_t i = 1, e = ranges.size(); i != e; ++i)
+    if (ranges[i].begin == off)
+      return true;
+  return !ranges.empty() && ranges.back().end == off;
+}
+
+static bool hasRISCVFunctionRangeStart(ArrayRef<RISCVFunctionRange> ranges,
+                                       uint64_t off) {
+  return llvm::any_of(
+      ranges, [=](const RISCVFunctionRange &r) { return r.begin == off; });
 }
 
 static bool isAllZero(ArrayRef<uint8_t> data) {
@@ -3288,6 +3322,7 @@ static RISCVFunctionSplitAuditResult auditRISCVFunctionSplitSection(
     result.candidateFunctionBytes += r.end - r.begin;
   }
   ranges = std::move(unique);
+  result.ranges = ranges;
   result.functionCount = ranges.size();
 
   uint64_t cursor = 0;
@@ -3340,7 +3375,139 @@ static RISCVFunctionSplitAuditResult auditRISCVFunctionSplitSection(
   return result;
 }
 
+template <class ELFT>
+static bool splitRISCVFunctionSplitSection(
+    const RISCVFunctionSplitAuditResult &plan, RISCVFunctionSplitStats &stats) {
+  InputSection *parent = plan.parent;
+  if (riscvFunctionSplitChildren.contains(parent))
+    return false;
+  if (parent->kind() != SectionBase::Regular)
+    return false;
+
+  RelsOrRelas<ELFT> rels = parent->template relsOrRelas<ELFT>();
+  if (rels.areRelocsRel())
+    return false;
+
+  SmallVector<std::pair<Defined *, uint32_t>, 0> rebindings;
+  auto *file = cast<ObjFile<ELFT>>(parent->file);
+  for (Symbol *sym : file->getSymbols()) {
+    auto *d = dyn_cast_or_null<Defined>(sym);
+    if (!d || d->section != parent || d->isSection())
+      continue;
+
+    int i = rangeIndex(plan.ranges, d->value);
+    if (i == -1)
+      return false;
+    if (d->size) {
+      if (d->size > std::numeric_limits<uint64_t>::max() - d->value ||
+          !rangeInOnePiece(plan.ranges, d->value, d->value + d->size))
+        return false;
+    } else if (isRISCVFunctionSplitBoundary(plan.ranges, d->value) &&
+               (d->type != STT_FUNC ||
+                !hasRISCVFunctionRangeStart(plan.ranges, d->value))) {
+      return false;
+    }
+    rebindings.push_back({d, static_cast<uint32_t>(i)});
+  }
+
+  using Elf_Rela = typename ELFT::Rela;
+  SmallVector<SmallVector<Elf_Rela, 0>, 0> partitionedRelas;
+  partitionedRelas.resize(plan.ranges.size());
+  for (const Elf_Rela &rel : rels.relas) {
+    int i = rangeIndex(plan.ranges, rel.r_offset);
+    if (i == -1)
+      return false;
+    Elf_Rela copy = rel;
+    copy.r_offset -= plan.ranges[i].begin;
+    partitionedRelas[i].push_back(copy);
+  }
+
+  SmallVector<InputSection *, 0> children;
+  children.reserve(plan.ranges.size());
+  ArrayRef<uint8_t> parentContent = parent->content();
+  for (auto [i, r] : llvm::enumerate(plan.ranges)) {
+    ArrayRef<uint8_t> data =
+        parentContent.slice(r.begin, static_cast<size_t>(r.end - r.begin));
+    auto *child = makeThreadLocal<InputSection>(
+        parent->file, parent->flags, parent->type,
+        i == 0 ? parent->addralign : 1, data, parent->name);
+    child->entsize = parent->entsize;
+    child->link = parent->link;
+    child->info = parent->info;
+    child->relSecIdx = parent->relSecIdx;
+    child->keepUnique = true;
+    RISCVFunctionSplitRelocStorage storage;
+    storage.relocsAreRela = true;
+    storage.relocCount = static_cast<uint32_t>(partitionedRelas[i].size());
+    storage.parent = parent;
+    storage.originalBegin = r.begin;
+    storage.originalEnd = r.end;
+    if (!partitionedRelas[i].empty()) {
+      auto *buf = makeThreadLocalN<Elf_Rela>(partitionedRelas[i].size());
+      llvm::copy(partitionedRelas[i], buf);
+      storage.relocs = buf;
+    }
+    riscvFunctionSplitRelocStorage[child] = storage;
+    children.push_back(child);
+  }
+
+  for (size_t i = 0, e = children.size(); i != e; ++i)
+    children[i]->nextInSectionGroup = children[(i + 1) % e];
+
+  for (auto [d, i] : rebindings) {
+    d->section = children[i];
+    d->value -= plan.ranges[i].begin;
+  }
+
+  SmallVector<InputSectionBase *, 0> childBases;
+  for (InputSection *child : children)
+    childBases.push_back(child);
+  riscvFunctionSplitChildren[parent] = std::move(childBases);
+  ++stats.splitParentCount;
+  stats.createdChildCount += static_cast<uint32_t>(children.size());
+  stats.splitBytes += parent->content().size();
+  stats.symbolRebindCount += static_cast<uint32_t>(rebindings.size());
+  stats.relocationRepartitionCount += static_cast<uint32_t>(rels.relas.size());
+  SmallVector<SmallVector<uint64_t, 0>, 0> childRelocOffsets;
+  childRelocOffsets.resize(partitionedRelas.size());
+  for (size_t i = 0, e = partitionedRelas.size(); i != e; ++i)
+    for (const Elf_Rela &rel : partitionedRelas[i])
+      childRelocOffsets[i].push_back(rel.r_offset);
+  stats.details.push_back({parent, plan.ranges, std::move(childRelocOffsets),
+                           static_cast<uint32_t>(rels.relas.size())});
+  return true;
+}
+
+template <class ELFT>
+static RISCVFunctionSplitStats
+splitRISCVFunctionSections(ArrayRef<RISCVFunctionSplitAuditResult> results) {
+  RISCVFunctionSplitStats stats;
+  riscvFunctionSplitChildren.clear();
+  riscvFunctionSplitRelocStorage.clear();
+
+  for (const RISCVFunctionSplitAuditResult &r : results) {
+    if (!r.safe)
+      continue;
+    if (r.ranges.size() <= 1) {
+      if (r.ranges.size() == 1)
+        ++stats.skippedSafeSingleFunctionParentCount;
+      continue;
+    }
+    if (r.gapBytes != 0 || script->hasSectionsCommand || config->emitRelocs ||
+        config->copyRelocs || config->gdbIndex) {
+      ++stats.parentFallbackCount;
+      continue;
+    }
+    if (!splitRISCVFunctionSplitSection<ELFT>(r, stats))
+      ++stats.parentFallbackCount;
+  }
+
+  return stats;
+}
+
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
+  riscvFunctionSplitChildren.clear();
+  riscvFunctionSplitRelocStorage.clear();
   if (!config->riscvFunctionSectionsSplit || config->emachine != EM_RISCV ||
       config->is64 || config->relocatable)
     return;
@@ -3362,6 +3529,9 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
         results.push_back(r);
     }
   }
+
+  RISCVFunctionSplitStats splitStats =
+      splitRISCVFunctionSections<ELFT>(results);
 
   if (!config->printRISCVFunctionSectionsSplit)
     return;
@@ -3396,17 +3566,14 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
                               RISCVFunctionSplitBlockReason::Count);
          ++i)
       if (r.reasons.test(i))
-    	reasons.push_back(blockReasonToString(
-    static_cast<RISCVFunctionSplitBlockReason>(i)));
+        reasons.push_back(blockReasonToString(
+            static_cast<RISCVFunctionSplitBlockReason>(i)));
     llvm::sort(reasons);
-    /*message(Twine("riscv-function-sections-split: block reasons: ") +
-            llvm::join(reasons.begin(), reasons.end(), ","));*/
-    if (reasons.empty()) {
-	message("riscv-function-sections-split: block reasons: none");
-    } else {
-  	message(Twine("riscv-function-sections-split: block reasons: ") +
-          llvm::join(reasons.begin(), reasons.end(), ","));
-    }
+    if (reasons.empty())
+      message("riscv-function-sections-split: block reasons: none");
+    else
+      message(Twine("riscv-function-sections-split: block reasons: ") +
+              llvm::join(reasons.begin(), reasons.end(), ","));
     candidateBytes += r.candidateFunctionBytes;
     functionRanges += r.functionCount;
     if (r.safe) {
@@ -3436,6 +3603,37 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
       message(Twine("riscv-function-sections-split: summary: ") +
               blockReasonToString(static_cast<RISCVFunctionSplitBlockReason>(i)) + ": " +
               Twine(reasonCounts[i]));
+  message(Twine("riscv-function-sections-split: phase1a: split parent count: ") +
+          Twine(splitStats.splitParentCount));
+  message(Twine("riscv-function-sections-split: phase1a: skipped safe single-function parent count: ") +
+          Twine(splitStats.skippedSafeSingleFunctionParentCount));
+  message(Twine("riscv-function-sections-split: phase1a: created child count: ") +
+          Twine(splitStats.createdChildCount));
+  message(Twine("riscv-function-sections-split: phase1a: split bytes: ") +
+          Twine(splitStats.splitBytes));
+  message(Twine("riscv-function-sections-split: phase1a: symbol rebind count: ") +
+          Twine(splitStats.symbolRebindCount));
+  message(Twine("riscv-function-sections-split: phase1a: relocation repartition count: ") +
+          Twine(splitStats.relocationRepartitionCount));
+  message(Twine("riscv-function-sections-split: phase1a: parent fallback count: ") +
+          Twine(splitStats.parentFallbackCount));
+  for (const RISCVFunctionSplitDetail &d : splitStats.details) {
+    message(Twine("riscv-function-sections-split: phase1a: split parent: ") +
+            toString(d.parent->file) + ":(" + d.parent->name + ") size " +
+            Twine(d.parent->content().size()) + " children " +
+            Twine(d.ranges.size()) + " relocs " + Twine(d.relocationCount));
+    for (auto [i, r] : llvm::enumerate(d.ranges)) {
+      message(Twine("riscv-function-sections-split: phase1a: child range: [") +
+              Twine(r.begin) + "," + Twine(r.end) + ")");
+      SmallVector<std::string, 0> offsets;
+      for (uint64_t off : d.childRelocOffsets[i])
+        offsets.push_back(Twine(off).str());
+      std::string offsetList =
+          offsets.empty() ? std::string("none") : llvm::join(offsets, ",");
+      message(Twine("riscv-function-sections-split: phase1a: child relocation offsets: ") +
+              offsetList);
+    }
+  }
 }
 } // namespace
 
@@ -3699,6 +3897,12 @@ void LinkerDriver::link(opt::InputArgList &args) {
       for (InputSectionBase *s : f->getSections()) {
         if (!s || s == &InputSection::discarded)
           continue;
+        auto splitIt = riscvFunctionSplitChildren.find(s);
+        if (splitIt != riscvFunctionSplitChildren.end()) {
+          for (InputSectionBase *child : splitIt->second)
+            ctx.inputSections.push_back(child);
+          continue;
+        }
         if (LLVM_UNLIKELY(isa<EhInputSection>(s)))
           ctx.ehInputSections.push_back(cast<EhInputSection>(s));
         else
