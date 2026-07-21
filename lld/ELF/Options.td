@@ -391,6 +391,10 @@ def riscv_function_sections_split: FF<"riscv-function-sections-split">,
   HelpText<"Audit RISC-V function-level InputSection splitting candidates">,
   Flags<[HelpHidden]>;
 
+def riscv_function_sections_split_gc: FF<"riscv-function-sections-split-gc">,
+  HelpText<"Allow safe RISC-V function section split children to be garbage-collected independently">,
+  Flags<[HelpHidden]>;
+
 defm remap_inputs: EEq<"remap-inputs",
   "Remap input files matching <from-glob> to <to-file>">,
   MetaVarName<"<from-glob>=<to-file>">;

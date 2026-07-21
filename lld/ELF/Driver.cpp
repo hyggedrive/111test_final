@@ -1374,8 +1374,11 @@ static void readConfigs(opt::InputArgList &args) {
       args.getLastArgValue(OPT_print_symbol_order);
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
+  config->riscvFunctionSectionsSplitGC =
+      args.hasArg(OPT_riscv_function_sections_split_gc);
   config->riscvFunctionSectionsSplit =
-      args.hasArg(OPT_riscv_function_sections_split);
+      args.hasArg(OPT_riscv_function_sections_split) ||
+      config->riscvFunctionSectionsSplitGC;
   config->rpath = getRpath(args);
   config->relocatable = args.hasArg(OPT_relocatable);
 
@@ -3451,8 +3454,9 @@ static bool splitRISCVFunctionSplitSection(
     children.push_back(child);
   }
 
-  for (size_t i = 0, e = children.size(); i != e; ++i)
-    children[i]->nextInSectionGroup = children[(i + 1) % e];
+  if (!config->riscvFunctionSectionsSplitGC)
+    for (size_t i = 0, e = children.size(); i != e; ++i)
+      children[i]->nextInSectionGroup = children[(i + 1) % e];
 
   for (auto [d, i] : rebindings) {
     d->section = children[i];
@@ -3634,6 +3638,74 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
               offsetList);
     }
   }
+}
+
+static void printRISCVFunctionSplitGCStats() {
+  if (!config->riscvFunctionSectionsSplitGC ||
+      !config->printRISCVFunctionSectionsSplit)
+    return;
+
+  uint32_t independentChildCount = 0, liveChildCount = 0, deadChildCount = 0;
+  uint64_t liveChildBytes = 0, deadChildBytes = 0;
+
+  struct ParentGCDetail {
+    InputSectionBase *parent = nullptr;
+    uint32_t liveChildren = 0;
+    uint32_t deadChildren = 0;
+    uint64_t liveBytes = 0;
+    uint64_t deadBytes = 0;
+  };
+  SmallVector<ParentGCDetail, 0> details;
+
+  for (auto &it : riscvFunctionSplitChildren) {
+    ParentGCDetail detail;
+    detail.parent = const_cast<InputSectionBase *>(it.first);
+    for (InputSectionBase *child : it.second) {
+      auto storageIt = riscvFunctionSplitRelocStorage.find(child);
+      uint64_t size =
+          storageIt == riscvFunctionSplitRelocStorage.end()
+              ? child->getSize()
+              : storageIt->second.originalEnd - storageIt->second.originalBegin;
+      ++independentChildCount;
+      if (child->isLive()) {
+        ++liveChildCount;
+        ++detail.liveChildren;
+        liveChildBytes += size;
+        detail.liveBytes += size;
+      } else {
+        ++deadChildCount;
+        ++detail.deadChildren;
+        deadChildBytes += size;
+        detail.deadBytes += size;
+      }
+    }
+    details.push_back(detail);
+  }
+
+  llvm::sort(details, [](const ParentGCDetail &a, const ParentGCDetail &b) {
+    std::string aFile = toString(a.parent->file);
+    std::string bFile = toString(b.parent->file);
+    if (aFile != bFile)
+      return aFile < bFile;
+    return a.parent->name < b.parent->name;
+  });
+
+  message(Twine("riscv-function-sections-split: phase2a: independent GC child count: ") +
+          Twine(independentChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: live child count: ") +
+          Twine(liveChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: dead child count: ") +
+          Twine(deadChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: live child bytes: ") +
+          Twine(liveChildBytes));
+  message(Twine("riscv-function-sections-split: phase2a: dead child bytes: ") +
+          Twine(deadChildBytes));
+  for (const ParentGCDetail &d : details)
+    message(Twine("riscv-function-sections-split: phase2a: parent: ") +
+            toString(d.parent->file) + ":(" + d.parent->name +
+            ") live children " + Twine(d.liveChildren) + " dead children " +
+            Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
+            " dead bytes " + Twine(d.deadBytes));
 }
 } // namespace
 
@@ -3982,6 +4054,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
+  printRISCVFunctionSplitGCStats();
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each
