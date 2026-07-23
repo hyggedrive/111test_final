@@ -382,8 +382,6 @@ def parse_objdump(text: str, sections: Dict[int, Section], obj: Path) -> List[In
                 operands=parts[1].strip() if len(parts) > 1 else "",
             )
         )
-    if not instructions:
-        raise AuditError(f"{obj}: failed to parse any instruction from llvm-objdump -d output")
     return instructions
 
 
@@ -629,21 +627,75 @@ def build_section_functions(obj: Path, section: Section, symbols: List[Symbol]) 
     return functions, audit
 
 
+def empty_object_result(obj: Path) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "object": str(obj),
+        "object_status": "no-executable-code",
+        "executable_section_count": 0,
+        "stt_func_total": 0,
+        "stt_func_symbol_total": 0,
+        "unique_function_range_total": 0,
+        "valid_sized_functions": 0,
+        "hard_blocked_functions": 0,
+        "clustered_functions": 0,
+        "independently_splittable_functions": 0,
+        "hard_blocked_function_ranges": 0,
+        "clustered_function_ranges": 0,
+        "independently_splittable_function_ranges": 0,
+        "independently_splittable_bytes": 0,
+        "executable_bytes": 0,
+        "section_symbol_relocations": 0,
+        "cross_function_relocations": 0,
+        "no_reloc_cross_function_edges": 0,
+        "unknown_control_flow_count": 0,
+        "relocated_direct_calls": 0,
+        "relocated_jals": 0,
+        "relocated_conditional_branches": 0,
+        "indirect_calls": 0,
+        "indirect_jumps": 0,
+        "computed_jump_blocked": 0,
+        "paired_call_jalr_skipped": 0,
+        "zero_size_blocked_symbols": 0,
+        "unresolved_relocation_targets": 0,
+        "unowned_relocations": 0,
+        "padding_relocations": 0,
+        "sections": [],
+        "functions": [],
+        "edges": [],
+        "clusters": [],
+        "independently_splittable_byte_ratio": 0.0,
+        "independently_splittable_function_ratio": 0.0,
+    }
+    return result
+
+
 def analyze_object(obj: Path, readelf: str, objdump: str) -> Dict[str, object]:
     hdr_text = run_tool([readelf, "-hW", str(obj)])
     sec_text = run_tool([readelf, "-SW", str(obj)])
     sym_text = run_tool([readelf, "-sW", str(obj)])
     rel_text = run_tool([readelf, "-rW", str(obj)])
-    dis_text = run_tool([objdump, "-d", str(obj)])
 
     validate_elf_header(hdr_text, obj)
     sections = parse_sections(sec_text, obj)
     symbols = parse_symbols(sym_text, sections, obj)
     relocs = parse_relocations(rel_text, sections, obj)
-    instructions = parse_objdump(dis_text, sections, obj)
     exec_sections = [s for s in sections.values() if s.is_executable_progbits]
     if not exec_sections:
-        raise AuditError(f"{obj}: no SHT_PROGBITS SHF_ALLOC|SHF_EXECINSTR sections found")
+        return empty_object_result(obj)
+    executable_bytes = sum(s.size for s in exec_sections)
+    if executable_bytes == 0:
+        return empty_object_result(obj)
+
+    dis_text = run_tool([objdump, "-d", str(obj)])
+    instructions = parse_objdump(dis_text, sections, obj)
+    exec_func_symbols = [
+        s for s in symbols
+        if s.typ == "FUNC" and s.section_index is not None and sections[s.section_index].is_executable_progbits
+    ]
+    if not instructions:
+        if not exec_func_symbols:
+            return empty_object_result(obj)
+        raise AuditError(f"{obj}: executable code exists but no instructions were parsed")
 
     all_functions: List[FunctionInfo] = []
     section_audits: List[SectionAudit] = []
@@ -990,6 +1042,7 @@ def analyze_object(obj: Path, readelf: str, objdump: str) -> Dict[str, object]:
 
     result = {
         "object": str(obj),
+        "object_status": "analyzed",
         "executable_section_count": len(exec_sections),
         "stt_func_total": sum(a.function_total for a in section_audits),
         "stt_func_symbol_total": sum(a.function_total for a in section_audits),
@@ -1145,6 +1198,9 @@ def aggregate(results: List[Dict[str, object]]) -> Dict[str, object]:
         "padding_relocations",
     ]
     total = {k: sum(int(r[k]) for r in results) for k in keys}
+    total["objects_without_executable_code"] = sum(
+        1 for r in results if r.get("object_status") == "no-executable-code"
+    )
     total["independently_splittable_byte_ratio"] = (
         total["independently_splittable_bytes"] / total["executable_bytes"]
         if total["executable_bytes"] else 0.0
@@ -1170,6 +1226,7 @@ def write_outputs(results: List[Dict[str, object]], out_dir: Path, name: str) ->
     lines.append("")
     for r in results:
         lines.append(f"== {r['object']} ==")
+        lines.append(f"object status: {r['object_status']}")
         lines.append(f"executable sections: {r['executable_section_count']}")
         lines.append(f"STT_FUNC symbol total: {r['stt_func_symbol_total']}")
         lines.append(f"unique function range total: {r['unique_function_range_total']}")
@@ -1235,6 +1292,7 @@ def write_outputs(results: List[Dict[str, object]], out_dir: Path, name: str) ->
 
     summary_fields = [
         "object",
+        "object_status",
         "executable_section_count",
         "stt_func_total",
         "stt_func_symbol_total",
