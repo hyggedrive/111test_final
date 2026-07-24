@@ -1375,10 +1375,13 @@ static void readConfigs(opt::InputArgList &args) {
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
   config->riscvFunctionSectionsSplitGC =
-      args.hasArg(OPT_riscv_function_sections_split_gc);
+	      args.hasFlag(OPT_riscv_function_sections_split_gc,
+			                       OPT_no_riscv_function_sections_split_gc,
+					                        false);
+
   config->riscvFunctionSectionsSplit =
-      args.hasArg(OPT_riscv_function_sections_split) ||
-      config->riscvFunctionSectionsSplitGC;
+	      args.hasArg(OPT_riscv_function_sections_split) ||
+	          config->riscvFunctionSectionsSplitGC;
   config->rpath = getRpath(args);
   config->relocatable = args.hasArg(OPT_relocatable);
 
@@ -1768,6 +1771,31 @@ static void readConfigs(opt::InputArgList &args) {
 static void setConfigs(opt::InputArgList &args) {
   ELFKind k = config->ekind;
   uint16_t m = config->emachine;
+
+  const bool isRISCV32 =
+	      config->emachine == EM_RISCV && !config->is64;
+
+  // RV32 下，用户未明确指定时默认开启 section GC。
+   if (!args.hasArg(OPT_gc_sections, OPT_no_gc_sections))
+     config->gcSections = isRISCV32;
+  
+  // RV32 下，用户未明确指定时默认开启 GP relaxation。
+  if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
+    config->relaxGP = isRISCV32;
+  
+  // RV32 下，用户未明确指定 ICF 时默认使用 safe。
+  if (isRISCV32 &&
+    !args.hasArg(OPT_icf_none, OPT_icf_safe, OPT_icf_all))
+          config->icf = ICFLevel::Safe;
+  
+  // RV32 默认开启函数拆分后的独立 GC。
+  if (!args.hasArg(OPT_riscv_function_sections_split_gc,
+			                  OPT_no_riscv_function_sections_split_gc))
+	   config->riscvFunctionSectionsSplitGC = isRISCV32; 
+  // SplitGC 开启时，基础 Split 必须同时开启。
+     config->riscvFunctionSectionsSplit =
+         config->riscvFunctionSectionsSplit ||
+            config->riscvFunctionSectionsSplitGC;
 
   config->copyRelocs = (config->relocatable || config->emitRelocs);
   config->is64 = (k == ELF64LEKind || k == ELF64BEKind);
