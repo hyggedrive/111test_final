@@ -1287,7 +1287,7 @@ static void readConfigs(opt::InputArgList &args) {
       args.hasArg(OPT_fix_cortex_a8) && !args.hasArg(OPT_relocatable);
   config->fortranCommon =
       args.hasFlag(OPT_fortran_common, OPT_no_fortran_common, false);
-  config->gcSections = args.hasFlag(OPT_gc_sections, OPT_no_gc_sections, true);
+  config->gcSections = args.hasFlag(OPT_gc_sections, OPT_no_gc_sections, false);
   config->gnuUnique = args.hasFlag(OPT_gnu_unique, OPT_no_gnu_unique, true);
   config->gdbIndex = args.hasFlag(OPT_gdb_index, OPT_no_gdb_index, false);
   config->icf = getICF(args);
@@ -1776,8 +1776,8 @@ static void setConfigs(opt::InputArgList &args) {
 	      config->emachine == EM_RISCV && !config->is64;
 
   // RV32 下，用户未明确指定时默认开启 section GC。
-  /* if (!args.hasArg(OPT_gc_sections, OPT_no_gc_sections))
-     config->gcSections = isRISCV32;*/
+   if (!args.hasArg(OPT_gc_sections, OPT_no_gc_sections))
+     config->gcSections = isRISCV32;
   
   // RV32 下，用户未明确指定时默认开启 GP relaxation。
   if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
