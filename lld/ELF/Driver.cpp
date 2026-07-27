@@ -1378,7 +1378,9 @@ static void readConfigs(opt::InputArgList &args) {
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
   config->riscvFunctionSectionsSplitDebugRelocs =
-      args.hasArg(OPT_riscv_function_sections_split_debug_relocs);
+	      args.hasFlag(OPT_riscv_function_sections_split_debug_relocs,
+			                       OPT_no_riscv_function_sections_split_debug_relocs,
+					                        false);
   config->riscvFunctionSectionsSplitGC =
 	      args.hasFlag(OPT_riscv_function_sections_split_gc,
 			                       OPT_no_riscv_function_sections_split_gc,
@@ -1800,6 +1802,10 @@ static void setConfigs(opt::InputArgList &args) {
   if (!args.hasArg(OPT_riscv_function_sections_split_gc,
 			                  OPT_no_riscv_function_sections_split_gc))
 	   config->riscvFunctionSectionsSplitGC = isRISCV32; 
+  if (!args.hasArg(OPT_riscv_function_sections_split_debug_relocs,
+			                   OPT_no_riscv_function_sections_split_debug_relocs))
+	    config->riscvFunctionSectionsSplitDebugRelocs = isRISCV32;
+
   config->riscvFunctionSectionsSplitGC =
       config->riscvFunctionSectionsSplitGC ||
       config->riscvFunctionSectionsSplitDebugRelocs;
