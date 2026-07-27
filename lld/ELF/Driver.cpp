@@ -1379,13 +1379,17 @@ static void readConfigs(opt::InputArgList &args) {
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
   config->riscvFunctionSectionsSplitDebugRelocs =
       args.hasArg(OPT_riscv_function_sections_split_debug_relocs);
+  config->riscvFunctionSectionsSplitICF =
+      args.hasFlag(OPT_riscv_function_sections_split_icf,
+                   OPT_no_riscv_function_sections_split_icf, false);
   config->riscvFunctionSectionsSplitGC =
 	      args.hasFlag(OPT_riscv_function_sections_split_gc,
 			                       OPT_no_riscv_function_sections_split_gc,
 					                        false);
   config->riscvFunctionSectionsSplitGC =
       config->riscvFunctionSectionsSplitGC ||
-      config->riscvFunctionSectionsSplitDebugRelocs;
+      config->riscvFunctionSectionsSplitDebugRelocs ||
+      config->riscvFunctionSectionsSplitICF;
 
   config->riscvFunctionSectionsSplit =
 	      args.hasArg(OPT_riscv_function_sections_split) ||
@@ -1802,7 +1806,8 @@ static void setConfigs(opt::InputArgList &args) {
 	   config->riscvFunctionSectionsSplitGC = isRISCV32; 
   config->riscvFunctionSectionsSplitGC =
       config->riscvFunctionSectionsSplitGC ||
-      config->riscvFunctionSectionsSplitDebugRelocs;
+      config->riscvFunctionSectionsSplitDebugRelocs ||
+      config->riscvFunctionSectionsSplitICF;
   // SplitGC 开启时，基础 Split 必须同时开启。
      config->riscvFunctionSectionsSplit =
          config->riscvFunctionSectionsSplit ||
@@ -3852,7 +3857,7 @@ static bool splitRISCVFunctionSplitSection(
     child->link = parent->link;
     child->info = parent->info;
     child->relSecIdx = parent->relSecIdx;
-    child->keepUnique = true;
+    child->keepUnique = !config->riscvFunctionSectionsSplitICF;
     RISCVFunctionSplitRelocStorage storage;
     storage.relocsAreRela = true;
     storage.relocCount = static_cast<uint32_t>(partitionedRelas[i].size());
