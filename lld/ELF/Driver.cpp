@@ -50,6 +50,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/LTO/LTO.h"
@@ -1369,6 +1370,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->printRISCVFunctionSectionsSplitRelocs =
+      args.hasArg(OPT_print_riscv_function_sections_split_relocs);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
@@ -2841,6 +2844,28 @@ struct RISCVFunctionRange {
   uint64_t end;
 };
 
+struct RISCVIncomingRelocAudit {
+  std::string sourceFile;
+  std::string sourceSection;
+  uint32_t sourceSectionType = 0;
+  uint64_t sourceSectionFlags = 0;
+  uint64_t sourceOffset = 0;
+  bool sourceAlloc = false;
+  bool sourceDebug = false;
+  bool sourceEhFrame = false;
+  RelType relocType = static_cast<RelType>(0);
+  std::string targetSymbol;
+  uint8_t targetSymbolType = STT_NOTYPE;
+  bool targetSectionSymbol = false;
+  int64_t addend = 0;
+  bool hasTargetOffset = false;
+  uint64_t targetOffset = 0;
+  bool uniquelyMappable = false;
+  bool targetGap = false;
+  bool targetBoundary = false;
+  uint64_t childLocalOffset = 0;
+};
+
 struct RISCVFunctionSplitAuditResult {
   InputSection *parent = nullptr;
   SmallVector<RISCVFunctionRange, 0> ranges;
@@ -2854,6 +2879,7 @@ struct RISCVFunctionSplitAuditResult {
   bool safe = true;
   std::bitset<static_cast<size_t>(RISCVFunctionSplitBlockReason::Count)>
       reasons;
+  SmallVector<RISCVIncomingRelocAudit, 0> incomingRelocs;
 };
 
 struct RISCVFunctionSplitDetail {
@@ -3049,6 +3075,46 @@ static int64_t getRISCVFunctionSplitAddend(const RelTy &rel) {
   if constexpr (RelTy::IsRela)
     return rel.r_addend;
   return 0;
+}
+
+template <class RelTy>
+static void recordIncomingRelocAudit(InputSection &parent,
+                                     ArrayRef<RISCVFunctionRange> ranges,
+                                     InputSectionBase &from, const RelTy &rel,
+                                     Defined &d,
+                                     RISCVFunctionSplitAuditResult &result) {
+  RISCVIncomingRelocAudit audit;
+  audit.sourceFile = toString(from.file);
+  audit.sourceSection = from.name.str();
+  audit.sourceSectionType = from.type;
+  audit.sourceSectionFlags = from.flags;
+  audit.sourceOffset = rel.r_offset;
+  audit.sourceAlloc = from.flags & SHF_ALLOC;
+  audit.sourceDebug = isDebugSection(from);
+  audit.sourceEhFrame = isa<EhInputSection>(&from);
+  audit.relocType = rel.getType(config->isMips64EL);
+  audit.targetSymbol = d.getName().str();
+  audit.targetSymbolType = d.type;
+  audit.targetSectionSymbol = d.isSection();
+  audit.addend = getRISCVFunctionSplitAddend(rel);
+
+  uint64_t target = d.value;
+  bool hasTarget = true;
+  if constexpr (RelTy::IsRela)
+    hasTarget = checkedAddend(d.value, rel.r_addend, target);
+  audit.hasTargetOffset = hasTarget;
+  if (hasTarget) {
+    audit.targetOffset = target;
+    int piece = rangeIndex(ranges, target);
+    audit.uniquelyMappable = piece != -1;
+    if (audit.uniquelyMappable)
+      audit.childLocalOffset = target - ranges[piece].begin;
+    else
+      audit.targetGap = target < parent.content().size();
+    audit.targetBoundary = hasRISCVFunctionRangeStart(ranges, target) ||
+                           isRISCVFunctionSplitBoundary(ranges, target);
+  }
+  result.incomingRelocs.push_back(std::move(audit));
 }
 
 template <class ELFT, class RelTy>
@@ -3251,6 +3317,7 @@ static void auditIncomingRelocs(InputSection &parent,
     if (!d || d->section != &parent)
       continue;
     ++result.incomingRelocationCount;
+    recordIncomingRelocAudit(parent, ranges, from, rel, *d, result);
     if (isa<EhInputSection>(&from)) {
       addReason(result, RISCVFunctionSplitBlockReason::IncomingEhFrame);
       continue;
@@ -3537,6 +3604,282 @@ splitRISCVFunctionSections(ArrayRef<RISCVFunctionSplitAuditResult> results) {
   return stats;
 }
 
+struct RISCVFunctionSplitBlockerCensus {
+  std::string name;
+  uint32_t parentCount = 0;
+  uint64_t functionCount = 0;
+  uint64_t parentBytes = 0;
+  uint64_t candidateBytes = 0;
+};
+
+static uint64_t censusFunctionCount(const RISCVFunctionSplitAuditResult &r) {
+  return r.functionCount ? r.functionCount : r.zeroSizeFunctionCount;
+}
+
+static void addBlockerCensus(
+    SmallVectorImpl<RISCVFunctionSplitBlockerCensus> &stats, StringRef name,
+    const RISCVFunctionSplitAuditResult &r) {
+  auto it = llvm::find_if(stats, [&](const RISCVFunctionSplitBlockerCensus &s) {
+    return s.name == name;
+  });
+  if (it == stats.end()) {
+    stats.push_back({name.str()});
+    it = std::prev(stats.end());
+  }
+  ++it->parentCount;
+  it->functionCount += censusFunctionCount(r);
+  it->parentBytes += r.executableBytes;
+  it->candidateBytes += r.candidateFunctionBytes;
+}
+
+static void addReasonBlockerCensus(
+    SmallVectorImpl<RISCVFunctionSplitBlockerCensus> &stats,
+    const RISCVFunctionSplitAuditResult &r) {
+  auto addIf = [&](RISCVFunctionSplitBlockReason reason, StringRef name) {
+    if (hasReason(r, reason))
+      addBlockerCensus(stats, name, r);
+  };
+  addIf(RISCVFunctionSplitBlockReason::UnsupportedSection,
+        "unsupported-section");
+  addIf(RISCVFunctionSplitBlockReason::ComdatOrGroup, "comdat-or-group");
+  addIf(RISCVFunctionSplitBlockReason::LinkOrder, "link-order");
+  addIf(RISCVFunctionSplitBlockReason::NoFunctionRanges,
+        "no-function-ranges");
+  addIf(RISCVFunctionSplitBlockReason::ZeroSizedOnly, "zero-sized-function");
+  addIf(RISCVFunctionSplitBlockReason::FunctionRangeOverflow,
+        "function-range-overflow");
+  addIf(RISCVFunctionSplitBlockReason::OverlappingFunctions,
+        "overlapping-function-range");
+  addIf(RISCVFunctionSplitBlockReason::SymbolRangeCrossesPiece,
+        "symbol-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::SourceRelocationUnowned,
+        "source-relocation-unowned");
+  addIf(RISCVFunctionSplitBlockReason::SourceSectionSymbol,
+        "source-section-symbol-relocation");
+  addIf(RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece,
+        "source-symbol-addend");
+  addIf(RISCVFunctionSplitBlockReason::IncomingSectionSymbol,
+        "incoming-section-symbol-relocation");
+  addIf(RISCVFunctionSplitBlockReason::IncomingAddendCrossesPiece,
+        "incoming-symbol-addend");
+  addIf(RISCVFunctionSplitBlockReason::IncomingEhFrame,
+        "incoming-eh-frame");
+  addIf(RISCVFunctionSplitBlockReason::IncomingDebugRelocation,
+        "incoming-debug-relocation");
+  addIf(RISCVFunctionSplitBlockReason::CallPairCrossesFunction,
+        "call-pair-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::PcrelPairCrossesFunction,
+        "pcrel-pair-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::AlignCrossesFunction,
+        "align-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::NoRelocCrossFunctionJal,
+        "jal-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::NoRelocCrossFunctionBranch,
+        "branch-crosses-function");
+  addIf(RISCVFunctionSplitBlockReason::FunctionFallthrough, "fallthrough");
+  addIf(RISCVFunctionSplitBlockReason::ComputedJump, "computed-jump");
+  addIf(RISCVFunctionSplitBlockReason::UnsupportedRvcControlFlow,
+        "unsupported-rvc-control-flow");
+  addIf(RISCVFunctionSplitBlockReason::UnexplainedGap, "unexplained-gap");
+
+  if (llvm::any_of(r.incomingRelocs,
+                   [](const RISCVIncomingRelocAudit &rel) {
+                     return rel.sourceAlloc;
+                   }))
+    addBlockerCensus(stats, "incoming-alloc-relocation", r);
+}
+
+struct RISCVFunctionSplitUnsafeParentCensus {
+  InputSection *parent = nullptr;
+  std::string blockers;
+  uint64_t functionCount = 0;
+  uint64_t candidateBytes = 0;
+  uint32_t incomingAlloc = 0;
+  uint32_t incomingNonAlloc = 0;
+  uint32_t incomingDebug = 0;
+  uint32_t incomingUnique = 0;
+  uint32_t incomingUnmappable = 0;
+};
+
+struct RISCVIncomingClassCensus {
+  uint64_t relocationCount = 0;
+  uint32_t parentCount = 0;
+};
+
+static void printRISCVFunctionSplitBlockerCensus(
+    ArrayRef<RISCVFunctionSplitAuditResult> results) {
+  SmallVector<RISCVFunctionSplitBlockerCensus, 0> blockerStats;
+  SmallVector<RISCVFunctionSplitUnsafeParentCensus, 0> parentStats;
+  StringMap<RISCVIncomingClassCensus> incomingStats;
+  uint32_t unsafeParentCount = 0;
+  uint64_t blockedFunctionCount = 0;
+  uint64_t blockedCandidateBytes = 0;
+
+  auto addIncomingClass = [&](StringRef name, uint32_t count) {
+    if (!count)
+      return;
+    RISCVIncomingClassCensus &s = incomingStats[name];
+    s.relocationCount += count;
+    ++s.parentCount;
+  };
+
+  for (const RISCVFunctionSplitAuditResult &r : results) {
+    if (r.safe)
+      continue;
+    ++unsafeParentCount;
+    blockedFunctionCount += censusFunctionCount(r);
+    blockedCandidateBytes += r.candidateFunctionBytes;
+
+    addReasonBlockerCensus(blockerStats, r);
+
+    SmallVector<StringRef, 0> blockers;
+    for (size_t i = 0; i != static_cast<size_t>(
+                              RISCVFunctionSplitBlockReason::Count);
+         ++i)
+      if (r.reasons.test(i))
+        blockers.push_back(blockReasonToString(
+            static_cast<RISCVFunctionSplitBlockReason>(i)));
+    llvm::sort(blockers);
+
+    RISCVFunctionSplitUnsafeParentCensus parent;
+    parent.parent = r.parent;
+    parent.blockers = blockers.empty() ? std::string("none")
+                                       : llvm::join(blockers, ",");
+    parent.functionCount = censusFunctionCount(r);
+    parent.candidateBytes = r.candidateFunctionBytes;
+    uint32_t sourceAlloc = 0, sourceNonAlloc = 0, sourceDebug = 0;
+    uint32_t sourceEhFrame = 0, sectionSymbol = 0, definedSymbol = 0;
+    uint32_t uniqueTarget = 0, gapTarget = 0, boundaryTarget = 0;
+    uint32_t unknownTarget = 0;
+    for (const RISCVIncomingRelocAudit &rel : r.incomingRelocs) {
+      if (rel.sourceAlloc)
+        ++sourceAlloc;
+      else
+        ++sourceNonAlloc;
+      if (rel.sourceDebug)
+        ++sourceDebug;
+      if (rel.sourceEhFrame)
+        ++sourceEhFrame;
+      if (rel.targetSectionSymbol)
+        ++sectionSymbol;
+      else
+        ++definedSymbol;
+      if (rel.uniquelyMappable)
+        ++uniqueTarget;
+      else if (rel.targetGap)
+        ++gapTarget;
+      else
+        ++unknownTarget;
+      if (rel.targetBoundary)
+        ++boundaryTarget;
+    }
+    parent.incomingAlloc = sourceAlloc;
+    parent.incomingNonAlloc = sourceNonAlloc;
+    parent.incomingDebug = sourceDebug;
+    parent.incomingUnique = uniqueTarget;
+    parent.incomingUnmappable =
+        static_cast<uint32_t>(r.incomingRelocs.size()) - uniqueTarget;
+    parentStats.push_back(std::move(parent));
+
+    addIncomingClass("alloc", sourceAlloc);
+    addIncomingClass("nonalloc", sourceNonAlloc);
+    addIncomingClass("debug", sourceDebug);
+    addIncomingClass("eh-frame", sourceEhFrame);
+    addIncomingClass("section-symbol-addend", sectionSymbol);
+    addIncomingClass("defined-symbol", definedSymbol);
+    addIncomingClass("target-function", uniqueTarget);
+    addIncomingClass("target-gap", gapTarget);
+    addIncomingClass("target-boundary", boundaryTarget);
+    addIncomingClass("target-unknown", unknownTarget);
+  }
+
+  llvm::sort(parentStats,
+             [](const RISCVFunctionSplitUnsafeParentCensus &a,
+                const RISCVFunctionSplitUnsafeParentCensus &b) {
+               std::string af = toString(a.parent->file);
+               std::string bf = toString(b.parent->file);
+               if (af != bf)
+                 return af < bf;
+               return a.parent->name < b.parent->name;
+             });
+  for (const RISCVFunctionSplitUnsafeParentCensus &p : parentStats)
+    message(Twine("riscv-function-sections-split: phase2b-audit: object: ") +
+            toString(p.parent->file) + " parent: " + p.parent->name +
+            " section bytes: " + Twine(p.parent->content().size()) +
+            " function count: " + Twine(p.functionCount) +
+            " candidate bytes: " + Twine(p.candidateBytes) +
+            " blockers: " + p.blockers +
+            " incoming alloc relocations: " + Twine(p.incomingAlloc) +
+            " incoming nonalloc relocations: " + Twine(p.incomingNonAlloc) +
+            " incoming debug relocations: " + Twine(p.incomingDebug) +
+            " uniquely mappable incoming relocations: " +
+            Twine(p.incomingUnique) + " unmappable incoming relocations: " +
+            Twine(p.incomingUnmappable));
+
+  message(Twine("riscv-function-sections-split: phase2b-audit: unsafe parent count: ") +
+          Twine(unsafeParentCount));
+  message(Twine("riscv-function-sections-split: phase2b-audit: blocked function count: ") +
+          Twine(blockedFunctionCount));
+  message(Twine("riscv-function-sections-split: phase2b-audit: blocked candidate bytes: ") +
+          Twine(blockedCandidateBytes));
+
+  llvm::sort(blockerStats, [](const RISCVFunctionSplitBlockerCensus &a,
+                              const RISCVFunctionSplitBlockerCensus &b) {
+    return a.name < b.name;
+  });
+  for (const RISCVFunctionSplitBlockerCensus &s : blockerStats)
+    message(Twine("riscv-function-sections-split: phase2b-audit: blocker ") +
+            s.name + ": parents " + Twine(s.parentCount) + " functions " +
+            Twine(s.functionCount) + " parent bytes " + Twine(s.parentBytes) +
+            " candidate bytes " + Twine(s.candidateBytes));
+
+  SmallVector<std::pair<std::string, RISCVIncomingClassCensus>, 0>
+      incomingClassStats;
+  for (const auto &it : incomingStats)
+    incomingClassStats.push_back({it.first().str(), it.second});
+  llvm::sort(incomingClassStats, [](const auto &a, const auto &b) {
+    return a.first < b.first;
+  });
+  for (const auto &it : incomingClassStats)
+    message(Twine("riscv-function-sections-split: phase2b-audit: incoming class ") +
+            it.first + ": relocations " + Twine(it.second.relocationCount) +
+            " parents " + Twine(it.second.parentCount));
+
+  if (!config->printRISCVFunctionSectionsSplitRelocs)
+    return;
+
+  SmallVector<const RISCVIncomingRelocAudit *, 0> relocs;
+  for (const RISCVFunctionSplitAuditResult &r : results)
+    if (!r.safe)
+      for (const RISCVIncomingRelocAudit &rel : r.incomingRelocs)
+        relocs.push_back(&rel);
+  llvm::sort(relocs, [](const RISCVIncomingRelocAudit *a,
+                        const RISCVIncomingRelocAudit *b) {
+    return std::tie(a->sourceFile, a->sourceSection, a->sourceOffset) <
+           std::tie(b->sourceFile, b->sourceSection, b->sourceOffset);
+  });
+  for (const RISCVIncomingRelocAudit *rel : relocs) {
+    std::string targetOffset =
+        rel->hasTargetOffset ? Twine(rel->targetOffset).str() : "none";
+    std::string childLocal =
+        rel->uniquelyMappable ? Twine(rel->childLocalOffset).str() : "none";
+    message(Twine("riscv-function-sections-split: phase2b-audit: incoming reloc: source object ") +
+            rel->sourceFile + " source section " + rel->sourceSection +
+            " source type " + Twine(rel->sourceSectionType) +
+            " source flags 0x" + utohexstr(rel->sourceSectionFlags) +
+            " source alloc " + Twine(rel->sourceAlloc ? 1 : 0) +
+            " offset " + Twine(rel->sourceOffset) + " type " +
+            toString(rel->relocType) + " target " + rel->targetSymbol +
+            " target type " + Twine(static_cast<unsigned>(
+                                   rel->targetSymbolType)) +
+            " target section " + Twine(rel->targetSectionSymbol ? 1 : 0) +
+            " addend " + Twine(rel->addend) + " target offset " +
+            targetOffset +
+            " unique " + Twine(rel->uniquelyMappable ? 1 : 0) +
+            " child local " + childLocal);
+  }
+}
+
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   riscvFunctionSplitChildren.clear();
   riscvFunctionSplitRelocStorage.clear();
@@ -3666,6 +4009,7 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
               offsetList);
     }
   }
+  printRISCVFunctionSplitBlockerCensus(results);
 }
 
 static void printRISCVFunctionSplitGCStats() {
