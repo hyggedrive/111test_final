@@ -400,6 +400,11 @@ def riscv_function_sections_split_gc: FF<"riscv-function-sections-split-gc">,
   HelpText<"Allow safe RISC-V function section split children to be garbage-collected independently">,
   Flags<[HelpHidden]>;
 
+def riscv_function_sections_split_debug_relocs
+    : FF<"riscv-function-sections-split-debug-relocs">,
+      HelpText<"Allow safe RISC-V function section split for non-alloc debug relocations">,
+      Flags<[HelpHidden]>;
+
 def no_riscv_function_sections_split_gc
     : FF<"no-riscv-function-sections-split-gc">,
       HelpText<"Disable independent GC for split RISC-V functions">;
