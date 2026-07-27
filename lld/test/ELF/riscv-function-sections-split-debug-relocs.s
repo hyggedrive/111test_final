@@ -22,6 +22,12 @@
 # ON: riscv-function-sections-split: status: safe
 # ON: riscv-function-sections-split: parent section: .text.addend_cross
 # ON: riscv-function-sections-split: block reasons: incoming-debug-relocation
+# ON: riscv-function-sections-split: parent section: .text.boundary
+# ON: riscv-function-sections-split: status: safe
+# ON: riscv-function-sections-split: parent section: .text.boundary_alloc
+# ON: riscv-function-sections-split: block reasons: incoming-debug-relocation
+# ON: riscv-function-sections-split: parent section: .text.zero_func
+# ON: riscv-function-sections-split: status: safe
 # ON: riscv-function-sections-split: parent section: .text.gap
 # ON: riscv-function-sections-split: block reasons: incoming-debug-relocation
 # ON: riscv-function-sections-split: parent section: .text.secsym
@@ -34,18 +40,26 @@
 # ON: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.accept)
 # ON: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.end)
 # ON: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.addend_ok)
-# ON: riscv-function-sections-split: phase2b-debug: accepted debug relocation count: 3
-# ON: riscv-function-sections-split: phase2b-debug: accepted interior relocation count: 2
+# ON: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.boundary)
+# ON: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.zero_func)
+# ON: riscv-function-sections-split: phase2b-debug: accepted debug relocation count: 4
+# ON: riscv-function-sections-split: phase2b-debug: planned debug relocation count:
+# ON: riscv-function-sections-split: phase2b-debug: accepted interior relocation count: 3
+# ON: riscv-function-sections-split: phase2b-debug: planned boundary-start relocation count:
 # ON: riscv-function-sections-split: phase2b-debug: accepted parent-end relocation count: 1
-# ON: riscv-function-sections-split: phase2b-debug: newly safe parent count: 3
-# ON: riscv-function-sections-split: phase2b-debug: newly split parent count: 3
+# ON: riscv-function-sections-split: phase2b-debug: rejected ambiguous-boundary relocation count:
+# ON: riscv-function-sections-split: phase2b-debug: newly safe parent count: 4
+# ON: riscv-function-sections-split: phase2b-debug: newly split parent count: 4
 # ON-DAG: riscv-function-sections-split: phase2b-debug: fallback: addend-crosses-child: parents 1
 # ON-DAG: riscv-function-sections-split: phase2b-debug: fallback: alloc-source: parents 1
 # ON-DAG: riscv-function-sections-split: phase2b-debug: fallback: section-symbol: parents 1
 # ON-DAG: riscv-function-sections-split: phase2b-debug: fallback: target-gap: parents 2
+# ON-DAG: riscv-function-sections-split: phase2b-debug: parent: {{.*}}:(.text.boundary_alloc) planned relocations: 1 {{.*}} rejected relocations: 1 fallbacks: alloc-source
 
 # NM-DAG: T accept_live
+# NM-DAG: T boundary_label
 # NM-DAG: T end_dead
+# NM-DAG: T zero_func_zero
 
 #--- main.s
 .globl _start
@@ -55,6 +69,8 @@ _start:
   call accept_live
   call end_dead
   call addend_ok0
+  call boundary0
+  call zero_func_zero
   ret
 .size _start, .-_start
 
@@ -118,6 +134,65 @@ addend_cross1:
 
 .section .debug_zgq_addend_cross,"",@progbits
   .word addend_cross_label + 4
+
+.section .text.boundary,"ax",@progbits
+.globl boundary_label
+.type boundary0,@function
+boundary0:
+boundary_label:
+  ret
+.size boundary0, .-boundary0
+.type boundary1,@function
+boundary1:
+  ret
+.size boundary1, .-boundary1
+
+.section .debug_zgq_boundary,"",@progbits
+  .word boundary_label
+
+.section .text.boundary_alloc,"ax",@progbits
+.globl boundary_alloc_label
+.type boundary_alloc0,@function
+boundary_alloc0:
+boundary_alloc_label:
+  ret
+.size boundary_alloc0, .-boundary_alloc0
+.type boundary_alloc1,@function
+boundary_alloc1:
+  ret
+.size boundary_alloc1, .-boundary_alloc1
+
+.section .debug_zgq_boundary_alloc,"",@progbits
+  .word boundary_alloc_label
+
+.section .rodata.boundary_alloc_ref,"a",@progbits
+  .word boundary_alloc_label
+
+.section .text.zero_func,"ax",@progbits
+.globl zero_func_zero
+.type zero_func_zero,@function
+zero_func_zero:
+.size zero_func_zero, 0
+.globl zero_func_live
+.type zero_func_live,@function
+zero_func_live:
+  ret
+.size zero_func_live, .-zero_func_live
+.type zero_func_dead,@function
+zero_func_dead:
+  ret
+.size zero_func_dead, .-zero_func_dead
+
+.section .text.unplanned_boundary,"ax",@progbits
+.type unplanned0,@function
+unplanned0:
+  ret
+.size unplanned0, .-unplanned0
+unplanned_boundary_label:
+.type unplanned1,@function
+unplanned1:
+  ret
+.size unplanned1, .-unplanned1
 
 .section .text.gap,"ax",@progbits
 .type gap0,@function
