@@ -1817,6 +1817,19 @@ static void setConfigs(opt::InputArgList &args) {
   config->picThunk = args.hasArg(OPT_pic_veneer, config->isPic);
   config->wordsize = config->is64 ? 8 : 4;
 
+  if (m == EM_RISCV && !config->is64 &&
+      config->riscvFunctionSectionsSplitDebugRelocs &&
+      llvm::none_of(config->deadRelocInNonAlloc,
+                    [](const std::pair<GlobPattern, uint64_t> &patAndValue) {
+                      return patAndValue.first.match(".debug_info");
+                    })) {
+    Expected<GlobPattern> pat = GlobPattern::create(".debug_info");
+    if (!pat)
+      error(toString(pat.takeError()));
+    else
+      config->deadRelocInNonAlloc.emplace_back(std::move(*pat), 0xffffffff);
+  }
+
   // ELF defines two different ways to store relocation addends as shown below:
   //
   //  Rel: Addends are stored to the location where relocations are applied. It
