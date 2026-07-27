@@ -2953,6 +2953,69 @@ struct RISCVIncomingRelocAudit {
   uint64_t childLocalOffset = 0;
 };
 
+enum class RISCVJalrAuditKind {
+  Return,
+  IndirectCall,
+  IndirectTailJump,
+  UnusualJalr,
+  Count,
+};
+
+static StringRef jalrAuditKindToString(RISCVJalrAuditKind kind) {
+  switch (kind) {
+  case RISCVJalrAuditKind::Return:
+    return "return";
+  case RISCVJalrAuditKind::IndirectCall:
+    return "indirect-call";
+  case RISCVJalrAuditKind::IndirectTailJump:
+    return "indirect-tail-jump";
+  case RISCVJalrAuditKind::UnusualJalr:
+    return "unusual-jalr";
+  case RISCVJalrAuditKind::Count:
+    break;
+  }
+  llvm_unreachable("invalid RISC-V jalr audit kind");
+}
+
+enum class RISCVCompressedNonJalrKind {
+  Ebreak,
+  Reserved,
+  Count,
+};
+
+static StringRef
+compressedNonJalrKindToString(RISCVCompressedNonJalrKind kind) {
+  switch (kind) {
+  case RISCVCompressedNonJalrKind::Ebreak:
+    return "compressed-ebreak";
+  case RISCVCompressedNonJalrKind::Reserved:
+    return "compressed-reserved";
+  case RISCVCompressedNonJalrKind::Count:
+    break;
+  }
+  llvm_unreachable("invalid RISC-V compressed non-jalr kind");
+}
+
+struct RISCVJalrAudit {
+  std::string functionName;
+  uint64_t offset = 0;
+  uint32_t raw = 0;
+  uint8_t width = 0;
+  uint32_t rd = 0;
+  uint32_t rs1 = 0;
+  int32_t imm = 0;
+  bool hasRelocation = false;
+  std::string relocations;
+  RISCVJalrAuditKind kind = RISCVJalrAuditKind::UnusualJalr;
+};
+
+struct RISCVCompressedNonJalrAudit {
+  std::string functionName;
+  uint64_t offset = 0;
+  uint16_t raw = 0;
+  RISCVCompressedNonJalrKind kind = RISCVCompressedNonJalrKind::Reserved;
+};
+
 struct RISCVFunctionSplitAuditResult {
   InputSection *parent = nullptr;
   SmallVector<RISCVFunctionRange, 0> ranges;
@@ -2974,6 +3037,8 @@ struct RISCVFunctionSplitAuditResult {
   std::array<uint32_t,
              static_cast<size_t>(RISCVFunctionSplitDebugFallbackReason::Count)>
       debugFallbackRelocCounts = {};
+  SmallVector<RISCVJalrAudit, 0> jalrAudits;
+  SmallVector<RISCVCompressedNonJalrAudit, 0> compressedNonJalrAudits;
 };
 
 struct RISCVFunctionSplitDetail {
@@ -3163,6 +3228,26 @@ static bool hasDirectReloc(
     return hasRelocType(rels, off, {R_RISCV_RVC_BRANCH});
   }
   llvm_unreachable("invalid RISC-V direct relocation kind");
+}
+
+static RISCVJalrAuditKind classifyJalr(uint32_t rd, uint32_t rs1,
+                                       int32_t imm) {
+  constexpr uint32_t x0 = 0;
+  constexpr uint32_t ra = 1;
+  if (rd == x0 && rs1 == ra && imm == 0)
+    return RISCVJalrAuditKind::Return;
+  // rd == ra only identifies a call-like JALR form. It does not prove that the
+  // runtime target is a function entry and is not by itself sufficient to
+  // remove the ComputedJump blocker.
+  if (rd == ra)
+    return RISCVJalrAuditKind::IndirectCall;
+  if (rd == x0 && rs1 != ra)
+    return RISCVJalrAuditKind::IndirectTailJump;
+  return RISCVJalrAuditKind::UnusualJalr;
+}
+
+static bool blocksComputedJump(RISCVJalrAuditKind kind) {
+  return kind != RISCVJalrAuditKind::Return;
 }
 
 static bool checkedAddend(uint64_t value, int64_t addend, uint64_t &result) {
@@ -3401,6 +3486,8 @@ static void auditSourceRelocs(InputSection &sec,
                               ArrayRef<RelTy> rels,
                               RISCVFunctionSplitAuditResult &result) {
   DenseMap<uint64_t, SmallVector<RelType, 0>> typesAtOffset;
+  DenseMap<uint64_t, SmallVector<std::string, 0>> relocsAtOffset;
+  const bool collectJalrAudit = config->printRISCVFunctionSectionsSplit;
   for (const RelTy &rel : rels) {
     ++result.sourceRelocationCount;
     RelType type = rel.getType(config->isMips64EL);
@@ -3408,32 +3495,93 @@ static void auditSourceRelocs(InputSection &sec,
     if (rangeIndex(ranges, off) == -1)
       addReason(result, RISCVFunctionSplitBlockReason::SourceRelocationUnowned);
     typesAtOffset[off].push_back(type);
+    if (collectJalrAudit) {
+      std::string target = "<none>";
+      if (rel.getSymbol(config->isMips64EL) != 0)
+        target = toString(sec.getFile<ELFT>()->getRelocTargetSym(rel));
+      relocsAtOffset[off].push_back(toString(type) + ":" + target);
+    }
   }
+
+  auto functionNameAt = [&](uint64_t off) {
+    std::string name = "<none>";
+    auto *file = cast<ObjFile<ELFT>>(sec.file);
+    for (Symbol *sym : file->getSymbols()) {
+      auto *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->section != &sec || d->type != STT_FUNC || d->size == 0)
+        continue;
+      if (d->value <= off && off < d->value + d->size) {
+        name = toString(*d);
+        break;
+      }
+    }
+    return name;
+  };
+
+  auto recordJalr = [&](uint64_t off, uint32_t raw, uint8_t width, uint32_t rd,
+                        uint32_t rs1, int32_t imm) {
+    RISCVJalrAuditKind kind = classifyJalr(rd, rs1, imm);
+    if (!collectJalrAudit)
+      return kind;
+    RISCVJalrAudit audit;
+    audit.functionName = functionNameAt(off);
+    audit.offset = off;
+    audit.raw = raw;
+    audit.width = width;
+    audit.rd = rd;
+    audit.rs1 = rs1;
+    audit.imm = imm;
+    auto relocIt = relocsAtOffset.find(off);
+    audit.hasRelocation = relocIt != relocsAtOffset.end();
+    if (audit.hasRelocation)
+      audit.relocations = llvm::join(relocIt->second.begin(),
+                                     relocIt->second.end(), ",");
+    else
+      audit.relocations = "none";
+    audit.kind = kind;
+    result.jalrAudits.push_back(std::move(audit));
+    return kind;
+  };
+
+  auto recordCompressedNonJalr = [&](uint64_t off, uint16_t raw,
+                                     RISCVCompressedNonJalrKind kind) {
+    if (!collectJalrAudit)
+      return;
+    RISCVCompressedNonJalrAudit audit;
+    audit.functionName = functionNameAt(off);
+    audit.offset = off;
+    audit.raw = raw;
+    audit.kind = kind;
+    result.compressedNonJalrAudits.push_back(std::move(audit));
+  };
 
   for (const RelTy &rel : rels) {
     RelType type = rel.getType(config->isMips64EL);
     uint64_t off = rel.r_offset;
     int func = rangeIndex(ranges, off);
-    Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
-    if (auto *d = dyn_cast<Defined>(&target)) {
-      if (d->section == &sec) {
-        if (d->isSection()) {
-          addReason(result, RISCVFunctionSplitBlockReason::SourceSectionSymbol);
-        } else if constexpr (!RelTy::IsRela) {
-          addReason(result,
-                    RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
-        } else {
-          uint64_t effectiveTarget;
-          int symbolPiece = rangeIndex(ranges, d->value);
-          bool ok = checkedAddend(d->value, rel.r_addend, effectiveTarget);
-          int targetPiece = ok ? rangeIndex(ranges, effectiveTarget) : -1;
-          if (!ok || symbolPiece == -1 || targetPiece == -1 ||
-              symbolPiece != targetPiece ||
-              (d->size &&
-               !rangeInOnePiece(ranges, d->value, d->value + d->size)))
-            addReason(
-                result,
-                RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+    if (rel.getSymbol(config->isMips64EL) != 0) {
+      Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      if (auto *d = dyn_cast<Defined>(&target)) {
+        if (d->section == &sec) {
+          if (d->isSection()) {
+            addReason(result,
+                      RISCVFunctionSplitBlockReason::SourceSectionSymbol);
+          } else if constexpr (!RelTy::IsRela) {
+            addReason(result,
+                      RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+          } else {
+            uint64_t effectiveTarget;
+            int symbolPiece = rangeIndex(ranges, d->value);
+            bool ok = checkedAddend(d->value, rel.r_addend, effectiveTarget);
+            int targetPiece = ok ? rangeIndex(ranges, effectiveTarget) : -1;
+            if (!ok || symbolPiece == -1 || targetPiece == -1 ||
+                symbolPiece != targetPiece ||
+                (d->size &&
+                 !rangeInOnePiece(ranges, d->value, d->value + d->size)))
+              addReason(
+                  result,
+                  RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+          }
         }
       }
     }
@@ -3512,10 +3660,20 @@ static void auditSourceRelocs(InputSection &sec,
         } else if (op == 2 && funct3 == 4 && bits(half, 6, 2) == 0) {
           uint32_t rs1 = bits(half, 11, 7);
           bool link = bits(half, 12, 12);
-          if (!link && rs1 == 1)
-            terminal = true;
-          else
+          if (rs1 != 0) {
+            RISCVJalrAuditKind kind =
+                recordJalr(off, half, 16, link ? 1 : 0, rs1, 0);
+            if (kind == RISCVJalrAuditKind::Return)
+              terminal = true;
+            else
+              addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
+          } else {
+            recordCompressedNonJalr(
+                off, half,
+                link ? RISCVCompressedNonJalrKind::Ebreak
+                     : RISCVCompressedNonJalrKind::Reserved);
             addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
+          }
         }
         if (hasDirectTarget)
           checkDirectTarget(ranges, typesAtOffset, result, off, target,
@@ -3572,7 +3730,9 @@ static void auditSourceRelocs(InputSection &sec,
         uint32_t rd = bits(insn, 11, 7);
         uint32_t rs1 = bits(insn, 19, 15);
         int64_t imm = SignExtend64<12>(bits(insn, 31, 20));
-        if (rd == 0 && rs1 == 1 && imm == 0)
+        RISCVJalrAuditKind kind =
+            recordJalr(off, insn, 32, rd, rs1, static_cast<int32_t>(imm));
+        if (kind == RISCVJalrAuditKind::Return)
           terminal = true;
         else
           addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
@@ -4390,6 +4550,17 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   std::array<uint32_t,
              static_cast<size_t>(RISCVFunctionSplitBlockReason::Count)>
       reasonCounts = {};
+  std::array<uint64_t, static_cast<size_t>(RISCVJalrAuditKind::Count)>
+      jalrKindCounts = {};
+  std::array<uint64_t, static_cast<size_t>(RISCVJalrAuditKind::Count)>
+      jalrKindCandidateBytes = {};
+  std::array<uint64_t,
+             static_cast<size_t>(RISCVCompressedNonJalrKind::Count)>
+      compressedNonJalrKindCounts = {};
+  uint64_t blockingJalrInstructions = 0;
+  uint64_t compressedNonJalrControlCount = 0;
+  uint32_t computedJumpAffectedParents = 0;
+  uint32_t computedJumpAffectedMultiFunctionParents = 0;
 
   for (const RISCVFunctionSplitAuditResult &r : results) {
     message(Twine("riscv-function-sections-split: parent section: ") +
@@ -4423,6 +4594,48 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
     else
       message(Twine("riscv-function-sections-split: block reasons: ") +
               llvm::join(reasons.begin(), reasons.end(), ","));
+    std::array<bool, static_cast<size_t>(RISCVJalrAuditKind::Count)>
+        parentHasJalrKind = {};
+    bool parentHasComputedJumpInstruction = false;
+    for (const RISCVJalrAudit &a : r.jalrAudits) {
+      ++jalrKindCounts[static_cast<size_t>(a.kind)];
+      parentHasJalrKind[static_cast<size_t>(a.kind)] = true;
+      if (blocksComputedJump(a.kind)) {
+        ++blockingJalrInstructions;
+        parentHasComputedJumpInstruction = true;
+      }
+      message(Twine("riscv-function-sections-split: computed-jump audit: "
+                    "object file ") +
+              toString(r.parent->file) + " parent " + r.parent->name +
+              " function " + a.functionName + " offset " + Twine(a.offset) +
+              " raw 0x" + utohexstr(a.raw) + " width " + Twine(a.width) +
+              " rd " + Twine(a.rd) + " rs1 " + Twine(a.rs1) +
+              " imm " + Twine(a.imm) +
+              " has relocation " + StringRef(a.hasRelocation ? "yes" : "no") +
+              " relocations " + a.relocations + " class " +
+              jalrAuditKindToString(a.kind));
+    }
+    for (const RISCVCompressedNonJalrAudit &a : r.compressedNonJalrAudits) {
+      ++compressedNonJalrControlCount;
+      ++compressedNonJalrKindCounts[static_cast<size_t>(a.kind)];
+      parentHasComputedJumpInstruction = true;
+      message(Twine("riscv-function-sections-split: computed-jump audit: "
+                    "object file ") +
+              toString(r.parent->file) + " parent " + r.parent->name +
+              " function " + a.functionName + " offset " + Twine(a.offset) +
+              " raw 0x" + utohexstr(a.raw) + " width 16 class " +
+              compressedNonJalrKindToString(a.kind));
+    }
+    if (parentHasComputedJumpInstruction) {
+      ++computedJumpAffectedParents;
+      if (r.functionCount > 1)
+        ++computedJumpAffectedMultiFunctionParents;
+    }
+    for (size_t i = 0; i != parentHasJalrKind.size(); ++i)
+      if (parentHasJalrKind[i])
+        // These per-kind byte counts are by affected parent. A parent with
+        // multiple JALR kinds contributes to multiple buckets.
+        jalrKindCandidateBytes[i] += r.candidateFunctionBytes;
     candidateBytes += r.candidateFunctionBytes;
     functionRanges += r.functionCount;
     if (r.safe) {
@@ -4452,6 +4665,46 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
       message(Twine("riscv-function-sections-split: summary: ") +
               blockReasonToString(static_cast<RISCVFunctionSplitBlockReason>(i)) + ": " +
               Twine(reasonCounts[i]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "blocking jalr instructions: ") +
+          Twine(blockingJalrInstructions));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "compressed non-jalr control instructions: ") +
+          Twine(compressedNonJalrControlCount));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "computed-jump blocker instructions: ") +
+          Twine(blockingJalrInstructions + compressedNonJalrControlCount));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "indirect-call count: ") +
+          Twine(jalrKindCounts[static_cast<size_t>(
+              RISCVJalrAuditKind::IndirectCall)]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "indirect-tail-jump count: ") +
+          Twine(jalrKindCounts[static_cast<size_t>(
+              RISCVJalrAuditKind::IndirectTailJump)]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "unusual-jalr count: ") +
+          Twine(jalrKindCounts[static_cast<size_t>(
+              RISCVJalrAuditKind::UnusualJalr)]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "compressed-ebreak count: ") +
+          Twine(compressedNonJalrKindCounts[static_cast<size_t>(
+              RISCVCompressedNonJalrKind::Ebreak)]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "compressed-reserved count: ") +
+          Twine(compressedNonJalrKindCounts[static_cast<size_t>(
+              RISCVCompressedNonJalrKind::Reserved)]));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "affected parent count: ") +
+          Twine(computedJumpAffectedParents));
+  message(Twine("riscv-function-sections-split: computed-jump summary: "
+                "affected multi-function parent count: ") +
+          Twine(computedJumpAffectedMultiFunctionParents));
+  for (size_t i = 0; i != static_cast<size_t>(RISCVJalrAuditKind::Count); ++i)
+    message(Twine("riscv-function-sections-split: computed-jump summary: "
+                  "affected-parent candidate bytes ") +
+            jalrAuditKindToString(static_cast<RISCVJalrAuditKind>(i)) + ": " +
+            Twine(jalrKindCandidateBytes[i]));
   message(Twine("riscv-function-sections-split: phase1a: split parent count: ") +
           Twine(splitStats.splitParentCount));
   message(Twine("riscv-function-sections-split: phase1a: skipped safe single-function parent count: ") +
