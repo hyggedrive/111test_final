@@ -864,11 +864,13 @@ static bool relax(InputSection &sec) {
           sec.relocs()[i + 1].type == R_RISCV_RELAX)
         relaxCall(sec, i, loc, r, remove);
       break;
-    case R_RISCV_JAL:
-      if (i + 1 != sec.relocs().size() &&
-          sec.relocs()[i + 1].type == R_RISCV_RELAX)
+    case R_RISCV_JAL: {
+      const bool hasRelaxMarker = i + 1 != sec.relocs().size() &&
+                                  sec.relocs()[i + 1].type == R_RISCV_RELAX;
+      if (config->relax && (hasRelaxMarker || config->riscvRelaxJalRVC))
         relaxJalToRVC(sec, i, loc, r, remove);
       break;
+    }
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD:
     case R_RISCV_TPREL_LO12_I:

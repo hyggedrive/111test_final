@@ -22,7 +22,17 @@
 # RUN: llvm-mc -filetype=obj -triple=riscv32 -mattr=+c,+relax norelax.s -o norelax.o
 # RUN: llvm-readelf -r norelax.o | FileCheck %s --check-prefix=NORELAX-RELOC
 # RUN: ld.lld -T lds norelax.o -o norelax
-# RUN: llvm-objdump -d --no-show-raw-insn -M no-aliases norelax | FileCheck %s --check-prefix=NORELAX
+# RUN: llvm-objdump -td --no-show-raw-insn -M no-aliases norelax | FileCheck %s --check-prefix=NORELAX
+
+## The opt-in option allows JAL relaxation without R_RISCV_RELAX.
+# RUN: ld.lld -T lds --riscv-relax-jal-rvc norelax.o -o norelax.opt
+# RUN: llvm-objdump -td --no-show-raw-insn -M no-aliases norelax.opt | FileCheck %s --check-prefix=NORELAX-OPT
+
+## The negative option wins and --no-relax keeps global priority.
+# RUN: ld.lld -T lds --riscv-relax-jal-rvc --no-riscv-relax-jal-rvc norelax.o -o norelax.off
+# RUN: llvm-objdump -td --no-show-raw-insn -M no-aliases norelax.off | FileCheck %s --check-prefix=NORELAX
+# RUN: ld.lld -T lds --riscv-relax-jal-rvc --no-relax norelax.o -o norelax.global-off
+# RUN: llvm-objdump -td --no-show-raw-insn -M no-aliases norelax.global-off | FileCheck %s --check-prefix=NORELAX
 
 ## Positive and negative range boundaries.
 # RUN: llvm-mc -filetype=obj -triple=riscv32 -mattr=+c,+relax range.s -o range.o
@@ -52,8 +62,21 @@
 
 # NORELAX-RELOC:      R_RISCV_JAL
 # NORELAX-RELOC-NOT:  R_RISCV_RELAX
+# NORELAX:      00010000 g       .text {{0*}}00000000 _start
+# NORELAX:      00010004 l       .text {{0*}}00000000 after_norelax_cj
+# NORELAX:      0001000c l       .text {{0*}}00000000 after_norelax_cjal
 # NORELAX-LABEL: <_start>:
 # NORELAX-NEXT:  jal      zero, {{.*}} <target_cj>
+# NORELAX-NEXT:  addi     zero, zero, 0
+# NORELAX-NEXT:  jal      ra, {{.*}} <target_cjal>
+
+# NORELAX-OPT:      00010000 g       .text {{0*}}00000000 _start
+# NORELAX-OPT:      00010002 l       .text {{0*}}00000000 after_norelax_cj
+# NORELAX-OPT:      00010008 l       .text {{0*}}00000000 after_norelax_cjal
+# NORELAX-OPT-LABEL: <_start>:
+# NORELAX-OPT-NEXT:  c.j      {{.*}} <target_cj>
+# NORELAX-OPT-NEXT:  addi     zero, zero, 0
+# NORELAX-OPT-NEXT:  c.jal    {{.*}} <target_cjal>
 
 # RANGE-LABEL: <pos_min>:
 # RANGE-NEXT:  c.j     {{.*}} <pos_target>
@@ -125,7 +148,18 @@ _start:
   .option norvc
   jal zero, target_cj
   .option pop
+after_norelax_cj:
+  .word 0x00000013
+  .option push
+  .option norelax
+  .option norvc
+  jal ra, target_cjal
+  .option pop
+after_norelax_cjal:
+  .word 0x00000013
 target_cj:
+  ret
+target_cjal:
   ret
 
 #--- range.s

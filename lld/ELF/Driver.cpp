@@ -1377,6 +1377,9 @@ static void readConfigs(opt::InputArgList &args) {
       args.getLastArgValue(OPT_print_symbol_order);
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
+  config->riscvRelaxJalRVC =
+      args.hasFlag(OPT_riscv_relax_jal_rvc,
+                   OPT_no_riscv_relax_jal_rvc, false);
   config->riscvFunctionSectionsSplitDebugRelocs =
       args.hasArg(OPT_riscv_function_sections_split_debug_relocs);
   config->riscvFunctionSectionsSplitICF =
