@@ -3485,6 +3485,10 @@ static StringRef classifyRISCVCompressedNonControl(uint16_t insn) {
     return "";
   }
 
+  // C.SWSP: quadrant 2, funct3=110. RV32C has no reserved register field.
+  if (op == 2 && funct3 == 6)
+    return "c.swsp";
+
   return "";
 }
 
@@ -4077,7 +4081,8 @@ proveRISCVNoreturnCFG(Symbol *sym,
   auto recordControlInsn = [&](const Insn &insn) {
     if (insn.cls == "non-terminal" || insn.cls == "nop" ||
         insn.cls == "ecall" || insn.cls == "ebreak" ||
-        insn.cls == "csr" || insn.cls == "c.addi" || insn.cls == "c.mv")
+        insn.cls == "csr" || insn.cls == "c.addi" ||
+        insn.cls == "c.mv" || insn.cls == "c.swsp")
       return;
     RISCVNoreturnCFGInsnAudit auditInsn;
     auditInsn.offset = insn.off;

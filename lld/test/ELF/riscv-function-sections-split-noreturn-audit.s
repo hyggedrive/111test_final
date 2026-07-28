@@ -40,6 +40,8 @@
 # CHECK-DAG: noreturn cfg: target c_addi_loop {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_c_mv_loop {{.*}} relocation target c_mv_loop resolved target c_mv_loop {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn cfg: target c_mv_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_c_swsp_loop {{.*}} relocation target c_swsp_loop resolved target c_swsp_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn cfg: target c_swsp_loop {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_branch_ret {{.*}} relocation target branch_ret resolved target branch_ret {{.*}} proof status reachable-return
 # CHECK-DAG: noreturn cfg: target branch_ret {{.*}} proof status reachable-return
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_indirect_target {{.*}} relocation target indirect_target resolved target indirect_target {{.*}} proof status reachable-indirect-control-flow
@@ -150,6 +152,11 @@ call_c_addi_loop:
 call_c_mv_loop:
   call c_mv_loop
 .size call_c_mv_loop, .-call_c_mv_loop
+
+.type call_c_swsp_loop,@function
+call_c_swsp_loop:
+  call c_swsp_loop
+.size call_c_swsp_loop, .-call_c_swsp_loop
 
 .type call_branch_ret,@function
 call_branch_ret:
@@ -325,6 +332,14 @@ c_mv_loop:
   .2byte 0xa001
   .reloc 1b, R_RISCV_RVC_JUMP, 1b
 .size c_mv_loop, .-c_mv_loop
+
+.type c_swsp_loop,@function
+c_swsp_loop:
+  .2byte 0xc606
+1:
+  .2byte 0xa001
+  .reloc 1b, R_RISCV_RVC_JUMP, 1b
+.size c_swsp_loop, .-c_swsp_loop
 .option pop
 
 .option norvc
