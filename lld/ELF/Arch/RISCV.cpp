@@ -12,6 +12,7 @@
 #include "Symbols.h"
 #include "SyntheticSections.h"
 #include "Target.h"
+#include "lld/Common/ErrorHandler.h"
 #include "llvm/Support/ELFAttributes.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/RISCVAttributeParser.h"
@@ -917,6 +918,102 @@ static bool relax(InputSection &sec) {
   return changed;
 }
 
+struct BranchRVCAuditStats {
+  uint64_t totalBranchRelocs = 0;
+  uint64_t validBranchOpcodes = 0;
+  uint64_t beqBneBranches = 0;
+  uint64_t zeroCompareBranches = 0;
+  uint64_t compressedRegisterBranches = 0;
+  uint64_t rangeQualifiedBranches = 0;
+  uint64_t markerQualifiedBranches = 0;
+  uint64_t noMarkerQualifiedBranches = 0;
+  uint64_t cBeqzCandidates = 0;
+  uint64_t cBnezCandidates = 0;
+};
+
+static bool isRVCBranchRegister(uint32_t reg) { return 8 <= reg && reg <= 15; }
+
+static bool hasSameOffsetRelaxMarker(ArrayRef<Relocation> rels, size_t i) {
+  return i + 1 != rels.size() && rels[i + 1].offset == rels[i].offset &&
+         rels[i + 1].type == R_RISCV_RELAX;
+}
+
+static void auditBranchRVCCandidates(const InputSection &sec) {
+  if (!config->printRISCVBranchRVCAudit)
+    return;
+
+  BranchRVCAuditStats stats;
+  const bool rvc = config->eflags & EF_RISCV_RVC;
+  ArrayRef<uint8_t> content = sec.content();
+  ArrayRef<Relocation> rels = sec.relocs();
+
+  for (auto [i, r] : llvm::enumerate(rels)) {
+    if (r.type != R_RISCV_BRANCH)
+      continue;
+    ++stats.totalBranchRelocs;
+    if (r.offset + 4 > content.size() || !r.sym)
+      continue;
+
+    uint32_t insn = read32le(content.data() + r.offset);
+    if ((insn & 0x7f) != 0x63)
+      continue;
+    ++stats.validBranchOpcodes;
+
+    uint32_t funct3 = extractBits(insn, 14, 12);
+    if (funct3 != 0 && funct3 != 1)
+      continue;
+    ++stats.beqBneBranches;
+
+    uint32_t rs1 = extractBits(insn, 19, 15);
+    uint32_t rs2 = extractBits(insn, 24, 20);
+    if (rs1 != 0 && rs2 != 0)
+      continue;
+    ++stats.zeroCompareBranches;
+    if (rs1 == 0 && rs2 == 0)
+      continue;
+
+    uint32_t reg = rs1 == 0 ? rs2 : rs1;
+    if (!isRVCBranchRegister(reg))
+      continue;
+    ++stats.compressedRegisterBranches;
+    if (!rvc)
+      continue;
+
+    uint64_t loc = sec.getVA(r.offset);
+    uint64_t dest = r.sym->getVA(r.addend);
+    int64_t displace =
+        static_cast<int64_t>(dest) - static_cast<int64_t>(loc);
+    if (!isInt<9>(displace) || (displace & 1))
+      continue;
+    ++stats.rangeQualifiedBranches;
+
+    if (hasSameOffsetRelaxMarker(rels, i))
+      ++stats.markerQualifiedBranches;
+    else
+      ++stats.noMarkerQualifiedBranches;
+    if (funct3 == 0)
+      ++stats.cBeqzCandidates;
+    else
+      ++stats.cBnezCandidates;
+  }
+
+  if (stats.totalBranchRelocs == 0)
+    return;
+
+  message(Twine("riscv branch-rvc audit: section=") + toString(&sec) +
+          " total=" + Twine(stats.totalBranchRelocs) +
+          " valid-opcode=" + Twine(stats.validBranchOpcodes) +
+          " beq-bne=" + Twine(stats.beqBneBranches) +
+          " zero=" + Twine(stats.zeroCompareBranches) +
+          " compact-reg=" + Twine(stats.compressedRegisterBranches) +
+          " range=" + Twine(stats.rangeQualifiedBranches) +
+          " marker=" + Twine(stats.markerQualifiedBranches) +
+          " no-marker=" + Twine(stats.noMarkerQualifiedBranches) +
+          " c-beqz=" + Twine(stats.cBeqzCandidates) +
+          " c-bnez=" + Twine(stats.cBnezCandidates) +
+          " estimated-bytes=" + Twine(stats.rangeQualifiedBranches * 2));
+}
+
 // When relaxing just R_RISCV_ALIGN, relocDeltas is usually changed only once in
 // the absence of a linker script. For call and load/store R_RISCV_RELAX, code
 // shrinkage may reduce displacement and make more relocations eligible for
@@ -1046,6 +1143,8 @@ void RISCV::finalizeRelax(int passes) const {
         } while (++i != e && rels[i].offset == cur);
         delta = aux.relocDeltas[i - 1];
       }
+
+      auditBranchRVCCandidates(*sec);
     }
   }
 }

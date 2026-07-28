@@ -1368,6 +1368,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printGcSections =
       args.hasFlag(OPT_print_gc_sections, OPT_no_print_gc_sections, false);
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
+  config->printRISCVBranchRVCAudit =
+      args.hasArg(OPT_print_riscv_branch_rvc_audit);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
   config->printRISCVFunctionSectionsSplitRelocs =

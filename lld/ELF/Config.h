@@ -269,6 +269,7 @@ struct Config {
   bool printGcSections;
   bool printIcfSections;
   bool printMemoryUsage;
+  bool printRISCVBranchRVCAudit;
   bool printRISCVFunctionSectionsSplit;
   bool printRISCVFunctionSectionsSplitRelocs;
   bool relax;

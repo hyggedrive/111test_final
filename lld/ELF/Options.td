@@ -384,6 +384,10 @@ def print_riscv_function_sections_split_relocs
       HelpText<"Print RISC-V function section split incoming relocation audit details">,
       Flags<[HelpHidden]>;
 
+def print_riscv_branch_rvc_audit: FF<"print-riscv-branch-rvc-audit">,
+  HelpText<"Print RISC-V branch to RVC compression candidate statistics">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;
