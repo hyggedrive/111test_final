@@ -3461,6 +3461,33 @@ static int64_t decodeCB(uint16_t insn) {
   return SignExtend64<9>(imm);
 }
 
+static StringRef classifyRISCVCompressedNonControl(uint16_t insn) {
+  uint16_t op = insn & 3;
+  uint16_t funct3 = bits(insn, 15, 13);
+  if (insn == 0x0001)
+    return "nop";
+
+  // C.ADDI: quadrant 1, funct3=000, rd != x0, nzimm != 0.
+  if (op == 1 && funct3 == 0) {
+    uint32_t rd = bits(insn, 11, 7);
+    uint32_t imm = (bits(insn, 12, 12) << 5) | bits(insn, 6, 2);
+    if (rd != 0 && imm != 0)
+      return "c.addi";
+    return "";
+  }
+
+  // C.MV: quadrant 2, funct3=100, bit12=0, rd != x0, rs2 != x0.
+  if (op == 2 && funct3 == 4 && bits(insn, 12, 12) == 0) {
+    uint32_t rd = bits(insn, 11, 7);
+    uint32_t rs2 = bits(insn, 6, 2);
+    if (rd != 0 && rs2 != 0)
+      return "c.mv";
+    return "";
+  }
+
+  return "";
+}
+
 static bool hasRelocType(const DenseMap<uint64_t, SmallVector<RelType, 0>> &rels,
                          uint64_t off, ArrayRef<RelType> types) {
   auto it = rels.find(off);
@@ -3912,12 +3939,13 @@ proveRISCVNoreturnCFG(Symbol *sym,
           }
         }
       } else {
-        insn.cls = half == 0x0001 ? "nop" : "non-terminal";
         // The proof-only CFG must not treat reserved compressed encodings as
         // ordinary fallthrough. Keep the whitelist intentionally small.
-        if (half == 0x0001)
+        StringRef cls = classifyRISCVCompressedNonControl(half);
+        if (!cls.empty()) {
+          insn.cls = cls.str();
           insn.successors.push_back(off + 2);
-        else {
+        } else {
           insn.cls = "unknown";
           insn.isUnknown = true;
         }
@@ -4049,7 +4077,7 @@ proveRISCVNoreturnCFG(Symbol *sym,
   auto recordControlInsn = [&](const Insn &insn) {
     if (insn.cls == "non-terminal" || insn.cls == "nop" ||
         insn.cls == "ecall" || insn.cls == "ebreak" ||
-        insn.cls == "csr")
+        insn.cls == "csr" || insn.cls == "c.addi" || insn.cls == "c.mv")
       return;
     RISCVNoreturnCFGInsnAudit auditInsn;
     auditInsn.offset = insn.off;

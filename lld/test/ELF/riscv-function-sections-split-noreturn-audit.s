@@ -36,6 +36,10 @@
 # CHECK-DAG: noreturn cfg: target self_loop16 {{.*}} self loop yes {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_ecall_loop {{.*}} relocation target ecall_loop resolved target ecall_loop {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn cfg: target ecall_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_c_addi_loop {{.*}} relocation target c_addi_loop resolved target c_addi_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn cfg: target c_addi_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_c_mv_loop {{.*}} relocation target c_mv_loop resolved target c_mv_loop {{.*}} proof status conservatively-proven
+# CHECK-DAG: noreturn cfg: target c_mv_loop {{.*}} proof status conservatively-proven
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_branch_ret {{.*}} relocation target branch_ret resolved target branch_ret {{.*}} proof status reachable-return
 # CHECK-DAG: noreturn cfg: target branch_ret {{.*}} proof status reachable-return
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_indirect_target {{.*}} relocation target indirect_target resolved target indirect_target {{.*}} proof status reachable-indirect-control-flow
@@ -54,6 +58,10 @@
 # CHECK-DAG: noreturn cfg: instruction target illegal16_target {{.*}} raw 0x0 width 16 class unknown
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_reserved16_target {{.*}} relocation target reserved16_target resolved target reserved16_target {{.*}} proof status reachable-unknown-instruction
 # CHECK-DAG: noreturn cfg: instruction target reserved16_target {{.*}} raw 0x4 width 16 class unknown
+# CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_bad_c_addi_target {{.*}} relocation target bad_c_addi_target resolved target bad_c_addi_target {{.*}} proof status reachable-unknown-instruction
+# CHECK-DAG: noreturn cfg: instruction target bad_c_addi_target {{.*}} raw 0x5 width 16 class unknown
+# CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_bad_c_mv_target {{.*}} relocation target bad_c_mv_target resolved target bad_c_mv_target {{.*}} proof status reachable-unknown-instruction
+# CHECK-DAG: noreturn cfg: instruction target bad_c_mv_target {{.*}} raw 0x8006 width 16 class unknown
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_mret_target {{.*}} relocation target mret_target resolved target mret_target {{.*}} proof status reachable-indirect-control-flow
 # CHECK-DAG: noreturn cfg: instruction target mret_target {{.*}} class system-return
 # CHECK-DAG: noreturn summary: noreturn direct-call audit count: {{[0-9]+}}
@@ -133,6 +141,16 @@ call_ecall_loop:
   call ecall_loop
 .size call_ecall_loop, .-call_ecall_loop
 
+.type call_c_addi_loop,@function
+call_c_addi_loop:
+  call c_addi_loop
+.size call_c_addi_loop, .-call_c_addi_loop
+
+.type call_c_mv_loop,@function
+call_c_mv_loop:
+  call c_mv_loop
+.size call_c_mv_loop, .-call_c_mv_loop
+
 .type call_branch_ret,@function
 call_branch_ret:
   call branch_ret
@@ -177,6 +195,16 @@ call_illegal16_target:
 call_reserved16_target:
   call reserved16_target
 .size call_reserved16_target, .-call_reserved16_target
+
+.type call_bad_c_addi_target,@function
+call_bad_c_addi_target:
+  call bad_c_addi_target
+.size call_bad_c_addi_target, .-call_bad_c_addi_target
+
+.type call_bad_c_mv_target,@function
+call_bad_c_mv_target:
+  call bad_c_mv_target
+.size call_bad_c_mv_target, .-call_bad_c_mv_target
 
 .type call_mret_target,@function
 call_mret_target:
@@ -281,6 +309,22 @@ ecall_loop:
 1:
   c.j 1b
 .size ecall_loop, .-ecall_loop
+
+.type c_addi_loop,@function
+c_addi_loop:
+  .2byte 0x1141
+1:
+  .2byte 0xa001
+  .reloc 1b, R_RISCV_RVC_JUMP, 1b
+.size c_addi_loop, .-c_addi_loop
+
+.type c_mv_loop,@function
+c_mv_loop:
+  .2byte 0x85aa
+1:
+  .2byte 0xa001
+  .reloc 1b, R_RISCV_RVC_JUMP, 1b
+.size c_mv_loop, .-c_mv_loop
 .option pop
 
 .option norvc
@@ -353,6 +397,16 @@ illegal16_target:
 reserved16_target:
   .2byte 0x0004
 .size reserved16_target, .-reserved16_target
+
+.type bad_c_addi_target,@function
+bad_c_addi_target:
+  .2byte 0x0005
+.size bad_c_addi_target, .-bad_c_addi_target
+
+.type bad_c_mv_target,@function
+bad_c_mv_target:
+  .2byte 0x8006
+.size bad_c_mv_target, .-bad_c_mv_target
 
 .type mret_target,@function
 mret_target:
