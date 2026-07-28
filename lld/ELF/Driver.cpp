@@ -2870,6 +2870,98 @@ struct RISCVFunctionRange {
   uint64_t end;
 };
 
+enum class RISCVFallthroughReason {
+  NoTerminal,
+  TerminalBeforeTrailingBytes,
+  ConditionalBranchAtEnd,
+  DirectCallAtEnd,
+  IndirectCallAtEnd,
+  IndirectJumpAtEnd,
+  UnknownInstruction,
+  TruncatedInstruction,
+  CompressedEbreak,
+  CompressedReserved,
+  Count,
+};
+
+static StringRef fallthroughReasonToString(RISCVFallthroughReason reason) {
+  switch (reason) {
+  case RISCVFallthroughReason::NoTerminal:
+    return "no-terminal";
+  case RISCVFallthroughReason::TerminalBeforeTrailingBytes:
+    return "terminal-before-trailing-bytes";
+  case RISCVFallthroughReason::ConditionalBranchAtEnd:
+    return "conditional-branch-at-end";
+  case RISCVFallthroughReason::DirectCallAtEnd:
+    return "direct-call-at-end";
+  case RISCVFallthroughReason::IndirectCallAtEnd:
+    return "indirect-call-at-end";
+  case RISCVFallthroughReason::IndirectJumpAtEnd:
+    return "indirect-jump-at-end";
+  case RISCVFallthroughReason::UnknownInstruction:
+    return "unknown-instruction";
+  case RISCVFallthroughReason::TruncatedInstruction:
+    return "truncated-instruction";
+  case RISCVFallthroughReason::CompressedEbreak:
+    return "compressed-ebreak";
+  case RISCVFallthroughReason::CompressedReserved:
+    return "compressed-reserved";
+  case RISCVFallthroughReason::Count:
+    break;
+  }
+  llvm_unreachable("invalid RISC-V fallthrough reason");
+}
+
+struct RISCVFallthroughInsnAudit {
+  bool valid = false;
+  uint64_t offset = 0;
+  uint32_t raw = 0;
+  uint8_t width = 0;
+  std::string insnClass;
+  uint32_t rd = 0;
+  uint32_t rs1 = 0;
+  uint32_t rs2 = 0;
+  int64_t imm = 0;
+  bool hasDirectTarget = false;
+  int64_t directTarget = 0;
+  bool targetInCurrentFunction = false;
+  bool targetInOtherFunction = false;
+  bool targetAtFunctionBoundary = false;
+  bool hasRelocation = false;
+  std::string relocations = "none";
+  bool partOfCallPair = false;
+  uint64_t pairStartOffset = 0;
+  std::string pairRelocations = "none";
+};
+
+struct RISCVFallthroughAudit {
+  std::string functionName;
+  std::string nextFunctionName;
+  uint64_t rangeBegin = 0;
+  uint64_t rangeEnd = 0;
+  uint64_t nextFunctionStart = 0;
+  uint64_t parentSize = 0;
+  bool adjacentToNextFunction = false;
+  bool lastFunction = false;
+  bool rangeEndIsParentEnd = false;
+  std::string tailBytesHex;
+  RISCVFallthroughInsnAudit lastInsn;
+  uint64_t lastInsnEnd = 0;
+  uint64_t trailingBytesAfterLastInsn = 0;
+  bool hasTruncatedTrailingBytes = false;
+  bool hasTerminal = false;
+  RISCVFallthroughInsnAudit terminalInsn;
+  std::string terminalKind = "none";
+  uint64_t trailingBytesAfterTerminal = 0;
+  bool terminalTrailingAllZero = false;
+  bool terminalTrailingNop = false;
+  bool terminalTrailingAlign = false;
+  bool terminalTrailingKnownPadding = false;
+  bool symbolBoundarySuspicious = false;
+  std::string symbolBoundaryDetail = "none";
+  RISCVFallthroughReason reason = RISCVFallthroughReason::NoTerminal;
+};
+
 enum class RISCVFunctionSplitDebugFallbackReason {
   AllocSource,
   NonDebugSource,
@@ -2973,6 +3065,7 @@ struct RISCVFunctionSplitAuditResult {
   std::array<uint32_t,
              static_cast<size_t>(RISCVFunctionSplitDebugFallbackReason::Count)>
       debugFallbackRelocCounts = {};
+  SmallVector<RISCVFallthroughAudit, 0> fallthroughAudits;
 };
 
 struct RISCVFunctionSplitDetail {
@@ -3097,6 +3190,17 @@ static bool isRISCVNopPadding(ArrayRef<uint8_t> data) {
     return false;
   }
   return true;
+}
+
+static std::string bytesToLowerHex(ArrayRef<uint8_t> data) {
+  static constexpr char hex[] = "0123456789abcdef";
+  std::string s;
+  s.reserve(data.size() * 2);
+  for (uint8_t b : data) {
+    s.push_back(hex[b >> 4]);
+    s.push_back(hex[b & 15]);
+  }
+  return s;
 }
 
 static uint32_t bits(uint32_t v, unsigned hi, unsigned lo) {
@@ -3400,6 +3504,8 @@ static void auditSourceRelocs(InputSection &sec,
                               ArrayRef<RelTy> rels,
                               RISCVFunctionSplitAuditResult &result) {
   DenseMap<uint64_t, SmallVector<RelType, 0>> typesAtOffset;
+  DenseMap<uint64_t, SmallVector<std::string, 0>> relocDescriptionsAtOffset;
+  const bool collectFallthroughAudit = config->printRISCVFunctionSectionsSplit;
   for (const RelTy &rel : rels) {
     ++result.sourceRelocationCount;
     RelType type = rel.getType(config->isMips64EL);
@@ -3407,32 +3513,189 @@ static void auditSourceRelocs(InputSection &sec,
     if (rangeIndex(ranges, off) == -1)
       addReason(result, RISCVFunctionSplitBlockReason::SourceRelocationUnowned);
     typesAtOffset[off].push_back(type);
+    if (collectFallthroughAudit) {
+      std::string target = "<none>";
+      if (rel.getSymbol(config->isMips64EL) != 0)
+        target = toString(sec.getFile<ELFT>()->getRelocTargetSym(rel));
+      int64_t addend = getRISCVFunctionSplitAddend(rel);
+      relocDescriptionsAtOffset[off].push_back(
+          (Twine(toString(type)) + ":" + target + ":" + Twine(addend)).str());
+    }
   }
+
+  SmallVector<std::string, 0> functionNames;
+  if (collectFallthroughAudit) {
+    functionNames.resize(ranges.size(), "<none>");
+    auto *file = cast<ObjFile<ELFT>>(sec.file);
+    for (Symbol *sym : file->getSymbols()) {
+      auto *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->section != &sec || d->type != STT_FUNC || d->size == 0)
+        continue;
+      int i = functionRangeStartIndex(ranges, d->value);
+      if (i != -1 && d->value + d->size == ranges[i].end &&
+          functionNames[i] == "<none>")
+        functionNames[i] = toString(*d);
+    }
+  }
+
+  auto relocationDescriptionAt = [&](uint64_t off) -> std::string {
+    auto it = relocDescriptionsAtOffset.find(off);
+    if (it == relocDescriptionsAtOffset.end())
+      return "none";
+    return llvm::join(it->second.begin(), it->second.end(), ",");
+  };
+
+  auto fillTargetInfo = [&](RISCVFallthroughInsnAudit &audit,
+                            const RISCVFunctionRange &range) {
+    if (!audit.hasDirectTarget)
+      return;
+    audit.targetInCurrentFunction =
+        audit.directTarget >= 0 &&
+        range.begin <= static_cast<uint64_t>(audit.directTarget) &&
+        static_cast<uint64_t>(audit.directTarget) < range.end;
+    int targetPiece =
+        audit.directTarget >= 0
+            ? rangeIndex(ranges, static_cast<uint64_t>(audit.directTarget))
+            : -1;
+    int currentPiece = rangeIndex(ranges, audit.offset);
+    audit.targetInOtherFunction =
+        targetPiece != -1 && currentPiece != -1 && targetPiece != currentPiece;
+    audit.targetAtFunctionBoundary =
+        audit.directTarget >= 0 &&
+        isRISCVFunctionSplitBoundary(ranges,
+                                     static_cast<uint64_t>(audit.directTarget));
+  };
+
+  auto makeInsnAudit = [&](uint64_t off, uint32_t raw, uint8_t width,
+                           StringRef insnClass,
+                           const RISCVFunctionRange &range) {
+    RISCVFallthroughInsnAudit audit;
+    audit.valid = true;
+    audit.offset = off;
+    audit.raw = raw;
+    audit.width = width;
+    audit.insnClass = insnClass.str();
+    audit.hasRelocation = relocDescriptionsAtOffset.contains(off);
+    if (audit.hasRelocation)
+      audit.relocations = relocationDescriptionAt(off);
+    fillTargetInfo(audit, range);
+    return audit;
+  };
+
+  auto classifyTrailing = [&](const RISCVFallthroughInsnAudit &lastInsn,
+                              bool hasTerminal) {
+    // The order is deliberate: precise control-flow classes win over generic
+    // "not terminal"; prior terminals with remaining bytes indicate a padding
+    // or symbol-size boundary question but still do not change eligibility.
+    if (!lastInsn.valid)
+      return RISCVFallthroughReason::TruncatedInstruction;
+    if (lastInsn.insnClass == "conditional-branch")
+      return RISCVFallthroughReason::ConditionalBranchAtEnd;
+    if (lastInsn.insnClass == "direct-call")
+      return RISCVFallthroughReason::DirectCallAtEnd;
+    if (lastInsn.insnClass == "indirect-call")
+      return RISCVFallthroughReason::IndirectCallAtEnd;
+    if (lastInsn.insnClass == "indirect-jump")
+      return RISCVFallthroughReason::IndirectJumpAtEnd;
+    if (lastInsn.insnClass == "compressed-ebreak")
+      return RISCVFallthroughReason::CompressedEbreak;
+    if (lastInsn.insnClass == "compressed-reserved")
+      return RISCVFallthroughReason::CompressedReserved;
+    if (lastInsn.insnClass == "unknown")
+      return RISCVFallthroughReason::UnknownInstruction;
+    if (hasTerminal)
+      return RISCVFallthroughReason::TerminalBeforeTrailingBytes;
+    return RISCVFallthroughReason::NoTerminal;
+  };
+
+  auto recordFallthrough =
+      [&](size_t rangeIndexValue, const RISCVFunctionRange &range,
+          RISCVFallthroughReason reason,
+          const RISCVFallthroughInsnAudit &lastInsn, uint64_t lastInsnEnd,
+          bool hasTerminal, const RISCVFallthroughInsnAudit &terminalInsn,
+          StringRef terminalKind, uint64_t terminalEnd,
+          bool truncatedTrailingBytes, StringRef symbolBoundaryDetail) {
+        if (!collectFallthroughAudit)
+          return;
+        for (const RISCVFallthroughAudit &a : result.fallthroughAudits)
+          if (a.rangeBegin == range.begin && a.rangeEnd == range.end)
+            return;
+        RISCVFallthroughAudit audit;
+        audit.functionName = functionNames[rangeIndexValue];
+        audit.nextFunctionName =
+            rangeIndexValue + 1 < ranges.size()
+                ? functionNames[rangeIndexValue + 1]
+                : std::string("<none>");
+        audit.rangeBegin = range.begin;
+        audit.rangeEnd = range.end;
+        audit.nextFunctionStart =
+            rangeIndexValue + 1 < ranges.size() ? ranges[rangeIndexValue + 1].begin
+                                                : sec.content().size();
+        audit.parentSize = sec.content().size();
+        audit.adjacentToNextFunction =
+            rangeIndexValue + 1 < ranges.size() &&
+            range.end == ranges[rangeIndexValue + 1].begin;
+        audit.lastFunction = rangeIndexValue + 1 == ranges.size();
+        audit.rangeEndIsParentEnd = range.end == sec.content().size();
+        uint64_t tailBegin = range.end - std::min<uint64_t>(16, range.end - range.begin);
+        audit.tailBytesHex =
+            bytesToLowerHex(sec.content().slice(tailBegin, range.end - tailBegin));
+        audit.lastInsn = lastInsn;
+        audit.lastInsnEnd = lastInsnEnd;
+        audit.trailingBytesAfterLastInsn =
+            lastInsnEnd <= range.end ? range.end - lastInsnEnd : 0;
+        audit.hasTruncatedTrailingBytes = truncatedTrailingBytes;
+        audit.symbolBoundaryDetail = symbolBoundaryDetail.str();
+        audit.symbolBoundarySuspicious = symbolBoundaryDetail != "none";
+        audit.hasTerminal = hasTerminal;
+        audit.terminalInsn = terminalInsn;
+        audit.terminalKind = terminalKind.str();
+        audit.trailingBytesAfterTerminal =
+            hasTerminal && terminalEnd <= range.end ? range.end - terminalEnd : 0;
+        if (hasTerminal && terminalEnd <= range.end) {
+          ArrayRef<uint8_t> trailing =
+              sec.content().slice(terminalEnd, range.end - terminalEnd);
+          audit.terminalTrailingAllZero = isAllZero(trailing);
+          audit.terminalTrailingNop = isRISCVNopPadding(trailing);
+          // R_RISCV_ALIGN addends are interpreted by RISC-V relaxation using
+          // the actual output location, so this audit does not claim that an
+          // arbitrary trailing range is fully covered by ALIGN.
+          audit.terminalTrailingAlign = false;
+          audit.terminalTrailingKnownPadding =
+              audit.terminalTrailingAllZero || audit.terminalTrailingNop ||
+              audit.terminalTrailingAlign;
+        }
+        audit.reason = reason;
+        result.fallthroughAudits.push_back(std::move(audit));
+      };
 
   for (const RelTy &rel : rels) {
     RelType type = rel.getType(config->isMips64EL);
     uint64_t off = rel.r_offset;
     int func = rangeIndex(ranges, off);
-    Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
-    if (auto *d = dyn_cast<Defined>(&target)) {
-      if (d->section == &sec) {
-        if (d->isSection()) {
-          addReason(result, RISCVFunctionSplitBlockReason::SourceSectionSymbol);
-        } else if constexpr (!RelTy::IsRela) {
-          addReason(result,
-                    RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
-        } else {
-          uint64_t effectiveTarget;
-          int symbolPiece = rangeIndex(ranges, d->value);
-          bool ok = checkedAddend(d->value, rel.r_addend, effectiveTarget);
-          int targetPiece = ok ? rangeIndex(ranges, effectiveTarget) : -1;
-          if (!ok || symbolPiece == -1 || targetPiece == -1 ||
-              symbolPiece != targetPiece ||
-              (d->size &&
-               !rangeInOnePiece(ranges, d->value, d->value + d->size)))
-            addReason(
-                result,
-                RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+    if (rel.getSymbol(config->isMips64EL) != 0) {
+      Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      if (auto *d = dyn_cast<Defined>(&target)) {
+        if (d->section == &sec) {
+          if (d->isSection()) {
+            addReason(result,
+                      RISCVFunctionSplitBlockReason::SourceSectionSymbol);
+          } else if constexpr (!RelTy::IsRela) {
+            addReason(result,
+                      RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+          } else {
+            uint64_t effectiveTarget;
+            int symbolPiece = rangeIndex(ranges, d->value);
+            bool ok = checkedAddend(d->value, rel.r_addend, effectiveTarget);
+            int targetPiece = ok ? rangeIndex(ranges, effectiveTarget) : -1;
+            if (!ok || symbolPiece == -1 || targetPiece == -1 ||
+                symbolPiece != targetPiece ||
+                (d->size &&
+                 !rangeInOnePiece(ranges, d->value, d->value + d->size)))
+              addReason(
+                  result,
+                  RISCVFunctionSplitBlockReason::SourceAddendCrossesPiece);
+          }
         }
       }
     }
@@ -3480,11 +3743,52 @@ static void auditSourceRelocs(InputSection &sec,
   ArrayRef<uint8_t> data = sec.content();
   const bool rvc =
       sec.getFile<ELFT>()->getObj().getHeader().e_flags & EF_RISCV_RVC;
-  for (const RISCVFunctionRange &r : ranges) {
+  struct RISCVFallthroughRangeAuditState {
+    RISCVFallthroughInsnAudit lastInsn;
+    RISCVFallthroughInsnAudit lastTerminalInsn;
+    std::string lastTerminalKind = "none";
+    uint64_t lastInsnEnd = 0;
+    uint64_t lastTerminalEnd = 0;
+    bool hasTerminal = false;
+  };
+
+  for (auto [rangeNo, r] : llvm::enumerate(ranges)) {
     uint64_t off = r.begin;
+    std::optional<RISCVFallthroughRangeAuditState> auditState;
+    if (collectFallthroughAudit) {
+      auditState.emplace();
+      auditState->lastInsnEnd = r.begin;
+      auditState->lastTerminalEnd = r.begin;
+    }
+    auto getSymbolBoundaryDetail = [&]() -> std::string {
+      SmallVector<StringRef, 0> details;
+      if (rangeNo + 1 < ranges.size() && r.end != ranges[rangeNo + 1].begin)
+        details.push_back("non-adjacent-next-range");
+      if (r.end > data.size())
+        details.push_back("range-end-after-parent");
+      if (r.begin & 1)
+        details.push_back("unaligned-range-begin");
+      if (r.end & 1)
+        details.push_back("unaligned-range-end");
+      if (details.empty())
+        return "none";
+      return llvm::join(details.begin(), details.end(), ",");
+    };
+    auto recordRangeFallthrough = [&](RISCVFallthroughReason reason,
+                                      bool truncated) {
+      if (!collectFallthroughAudit)
+        return;
+      recordFallthrough(
+          rangeNo, r, reason, auditState->lastInsn, auditState->lastInsnEnd,
+          auditState->hasTerminal, auditState->lastTerminalInsn,
+          auditState->lastTerminalKind, auditState->lastTerminalEnd, truncated,
+          getSymbolBoundaryDetail());
+    };
     while (off < r.end) {
       if (off + 2 > data.size()) {
         addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
+        recordRangeFallthrough(RISCVFallthroughReason::TruncatedInstruction,
+                               true);
         break;
       }
       uint16_t half = llvm::support::endian::read16le(data.data() + off);
@@ -3498,42 +3802,99 @@ static void auditSourceRelocs(InputSection &sec,
         bool hasDirectTarget = false;
         RISCVDirectRelocKind relocKind = RISCVDirectRelocKind::RvcJump;
         int64_t target = 0;
+        std::optional<RISCVFallthroughInsnAudit> insn;
+        if (collectFallthroughAudit)
+          insn.emplace(makeInsnAudit(off, half, 16, "compressed-other", r));
         if (op == 1 && (funct3 == 5 || funct3 == 1)) {
           target = static_cast<int64_t>(off) + decodeCJ(half);
           hasDirectTarget = true;
           relocKind = RISCVDirectRelocKind::RvcJump;
           terminal = funct3 == 5; // c.j is terminal; c.jal returns.
+          if (collectFallthroughAudit) {
+            insn->insnClass = terminal ? "unconditional-jump" : "direct-call";
+            insn->rd = terminal ? 0 : 1;
+            insn->hasDirectTarget = true;
+            insn->directTarget = target;
+            fillTargetInfo(*insn, r);
+          }
         } else if (op == 1 && (funct3 == 6 || funct3 == 7)) {
           target = static_cast<int64_t>(off) + decodeCB(half);
           hasDirectTarget = true;
           relocKind = RISCVDirectRelocKind::RvcBranch;
           branch = true;
+          if (collectFallthroughAudit) {
+            insn->insnClass = "conditional-branch";
+            insn->hasDirectTarget = true;
+            insn->directTarget = target;
+            fillTargetInfo(*insn, r);
+          }
         } else if (op == 2 && funct3 == 4 && bits(half, 6, 2) == 0) {
           uint32_t rs1 = bits(half, 11, 7);
           bool link = bits(half, 12, 12);
-          if (!link && rs1 == 1)
+          if (collectFallthroughAudit) {
+            insn->rs1 = rs1;
+            insn->rd = link ? 1 : 0;
+          }
+          if (!link && rs1 == 1) {
             terminal = true;
-          else
+            if (collectFallthroughAudit)
+              insn->insnClass = "return";
+          } else if (rs1 == 0) {
+            if (collectFallthroughAudit)
+              insn->insnClass =
+                  link ? "compressed-ebreak" : "compressed-reserved";
             addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
+          } else {
+            if (collectFallthroughAudit)
+              insn->insnClass = link ? "indirect-call" : "indirect-jump";
+            addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
+          }
+        } else if (half == 0x0001) {
+          if (collectFallthroughAudit)
+            insn->insnClass = "nop";
+        }
+        if (collectFallthroughAudit) {
+          auditState->lastInsn = *insn;
+          auditState->lastInsnEnd = off + 2;
+          if (terminal) {
+            auditState->hasTerminal = true;
+            auditState->lastTerminalInsn = *insn;
+            auditState->lastTerminalKind = insn->insnClass;
+            auditState->lastTerminalEnd = off + 2;
+          }
         }
         if (hasDirectTarget)
           checkDirectTarget(ranges, typesAtOffset, result, off, target,
                             relocKind);
-        if (branch && off + 2 == r.end)
+        if (branch && off + 2 == r.end) {
           addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
-        if (!terminal && off + 2 == r.end)
+          recordRangeFallthrough(
+              RISCVFallthroughReason::ConditionalBranchAtEnd, false);
+        }
+        if (!terminal && off + 2 == r.end) {
           addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
+          if (collectFallthroughAudit)
+            recordRangeFallthrough(
+                classifyTrailing(auditState->lastInsn,
+                                 auditState->hasTerminal),
+                false);
+        }
         off += 2;
         continue;
       }
 
       if (off + 4 > r.end) {
         addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
+        recordRangeFallthrough(RISCVFallthroughReason::TruncatedInstruction,
+                               true);
         break;
       }
       uint32_t insn = llvm::support::endian::read32le(data.data() + off);
       uint32_t opcode = insn & 0x7f;
       bool terminal = false;
+      std::optional<RISCVFallthroughInsnAudit> insnAudit;
+      if (collectFallthroughAudit)
+        insnAudit.emplace(makeInsnAudit(off, insn, 32, "unknown", r));
       if (opcode == 0x17 && off + 4 < r.end) {
         uint32_t next = llvm::support::endian::read32le(data.data() + off + 4);
         if ((next & 0x7f) == 0x67 &&
@@ -3549,9 +3910,31 @@ static void auditSourceRelocs(InputSection &sec,
             addReason(result,
                       RISCVFunctionSplitBlockReason::CallPairCrossesFunction);
           terminal = jalrRd == 0;
-          if (!terminal && off + 8 == r.end)
+          if (collectFallthroughAudit) {
+            insnAudit.emplace(makeInsnAudit(
+                off + 4, next, 32,
+                terminal ? "indirect-jump" : "direct-call", r));
+            insnAudit->rd = jalrRd;
+            insnAudit->rs1 = jalrRs1;
+            insnAudit->imm = SignExtend64<12>(bits(next, 31, 20));
+            insnAudit->partOfCallPair = true;
+            insnAudit->pairStartOffset = off;
+            insnAudit->pairRelocations = relocationDescriptionAt(off);
+            auditState->lastInsn = *insnAudit;
+            auditState->lastInsnEnd = off + 8;
+            if (terminal) {
+              auditState->hasTerminal = true;
+              auditState->lastTerminalInsn = *insnAudit;
+              auditState->lastTerminalKind = "indirect-jump";
+              auditState->lastTerminalEnd = off + 8;
+            }
+          }
+          if (!terminal && off + 8 == r.end) {
             addReason(result,
                       RISCVFunctionSplitBlockReason::FunctionFallthrough);
+            recordRangeFallthrough(RISCVFallthroughReason::DirectCallAtEnd,
+                                   false);
+          }
           off += 8;
           continue;
         }
@@ -3560,24 +3943,95 @@ static void auditSourceRelocs(InputSection &sec,
         int64_t target = static_cast<int64_t>(off) + decodeJal(insn);
         checkDirectTarget(ranges, typesAtOffset, result, off, target,
                           RISCVDirectRelocKind::Jal);
-        terminal = bits(insn, 11, 7) == 0;
+        uint32_t rd = bits(insn, 11, 7);
+        terminal = rd == 0;
+        if (collectFallthroughAudit) {
+          insnAudit->insnClass =
+              terminal ? "unconditional-jump" : "direct-call";
+          insnAudit->rd = rd;
+          insnAudit->hasDirectTarget = true;
+          insnAudit->directTarget = target;
+          fillTargetInfo(*insnAudit, r);
+        }
       } else if (opcode == 0x63) {
         int64_t target = static_cast<int64_t>(off) + decodeBranch(insn);
         checkDirectTarget(ranges, typesAtOffset, result, off, target,
                           RISCVDirectRelocKind::Branch);
-        if (off + 4 == r.end)
+        if (collectFallthroughAudit) {
+          insnAudit->insnClass = "conditional-branch";
+          insnAudit->rs1 = bits(insn, 19, 15);
+          insnAudit->rs2 = bits(insn, 24, 20);
+          insnAudit->hasDirectTarget = true;
+          insnAudit->directTarget = target;
+          fillTargetInfo(*insnAudit, r);
+        }
+        if (off + 4 == r.end) {
           addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
+          if (collectFallthroughAudit) {
+            auditState->lastInsn = *insnAudit;
+            auditState->lastInsnEnd = off + 4;
+            recordRangeFallthrough(
+                RISCVFallthroughReason::ConditionalBranchAtEnd, false);
+          }
+        }
       } else if (opcode == 0x67) {
         uint32_t rd = bits(insn, 11, 7);
         uint32_t rs1 = bits(insn, 19, 15);
         int64_t imm = SignExtend64<12>(bits(insn, 31, 20));
-        if (rd == 0 && rs1 == 1 && imm == 0)
+        if (collectFallthroughAudit) {
+          insnAudit->rd = rd;
+          insnAudit->rs1 = rs1;
+          insnAudit->imm = imm;
+        }
+        if (rd == 0 && rs1 == 1 && imm == 0) {
           terminal = true;
-        else
+          if (collectFallthroughAudit)
+            insnAudit->insnClass = "return";
+        } else {
+          if (collectFallthroughAudit)
+            insnAudit->insnClass =
+                rd == 0 ? "indirect-jump" : "indirect-call";
           addReason(result, RISCVFunctionSplitBlockReason::ComputedJump);
+        }
+      } else if (opcode == 0x73) {
+        if (collectFallthroughAudit)
+          insnAudit->insnClass =
+              insn == 0x00100073 ? "ebreak" : "unknown-system";
+      } else {
+        switch (opcode) {
+        case 0x03: // load
+        case 0x0f: // fence
+        case 0x13: // immediate arithmetic
+        case 0x17: // auipc
+        case 0x23: // store
+        case 0x33: // register arithmetic
+        case 0x37: // lui
+        case 0x53: // floating point
+          if (collectFallthroughAudit)
+            insnAudit->insnClass = "non-terminal";
+          break;
+        default:
+          break;
+        }
       }
-      if (!terminal && off + 4 == r.end)
+      if (collectFallthroughAudit) {
+        auditState->lastInsn = *insnAudit;
+        auditState->lastInsnEnd = off + 4;
+        if (terminal) {
+          auditState->hasTerminal = true;
+          auditState->lastTerminalInsn = *insnAudit;
+          auditState->lastTerminalKind = insnAudit->insnClass;
+          auditState->lastTerminalEnd = off + 4;
+        }
+      }
+      if (!terminal && off + 4 == r.end) {
         addReason(result, RISCVFunctionSplitBlockReason::FunctionFallthrough);
+        if (collectFallthroughAudit)
+          recordRangeFallthrough(
+              classifyTrailing(auditState->lastInsn,
+                               auditState->hasTerminal),
+              false);
+      }
       off += 4;
     }
   }
@@ -4353,6 +4807,114 @@ static void printRISCVFunctionSplitDebugRelocStats(
   }
 }
 
+static void printRISCVFunctionSplitFallthroughAudits(
+    ArrayRef<RISCVFunctionSplitAuditResult> results) {
+  std::array<uint64_t, static_cast<size_t>(RISCVFallthroughReason::Count)>
+      reasonCounts = {};
+  uint64_t fallthroughRanges = 0;
+  uint32_t affectedParents = 0, affectedMultiFunctionParents = 0;
+  uint64_t affectedParentCandidateBytes = 0;
+  uint64_t symbolBoundarySuspiciousFunctions = 0;
+
+  auto yesNo = [](bool v) -> StringRef { return v ? "yes" : "no"; };
+  auto printInsn = [&](StringRef label,
+                       const RISCVFallthroughInsnAudit &insn) {
+    if (!insn.valid) {
+      message(Twine("riscv-function-sections-split: fallthrough audit: ") +
+              label + " present no");
+      return;
+    }
+    std::string target =
+        insn.hasDirectTarget ? Twine(insn.directTarget).str() : "none";
+    message(Twine("riscv-function-sections-split: fallthrough audit: ") +
+            label + " present yes offset " + Twine(insn.offset) + " raw 0x" +
+            utohexstr(insn.raw) + " width " +
+            Twine(static_cast<unsigned>(insn.width)) + " class " +
+            insn.insnClass + " rd " + Twine(insn.rd) + " rs1 " +
+            Twine(insn.rs1) + " rs2 " + Twine(insn.rs2) + " imm " +
+            Twine(insn.imm) + " direct target " + target +
+            " target-current " + yesNo(insn.targetInCurrentFunction) +
+            " target-other " + yesNo(insn.targetInOtherFunction) +
+            " target-boundary " + yesNo(insn.targetAtFunctionBoundary) +
+            " has relocation " + yesNo(insn.hasRelocation) +
+            " relocations " + insn.relocations + " part of call pair " +
+            yesNo(insn.partOfCallPair) + " pair start offset " +
+            Twine(insn.pairStartOffset) + " pair relocations " +
+            insn.pairRelocations);
+  };
+
+  for (const RISCVFunctionSplitAuditResult &r : results) {
+    if (r.fallthroughAudits.empty())
+      continue;
+    ++affectedParents;
+    if (r.functionCount > 1)
+      ++affectedMultiFunctionParents;
+    // This is counted once per affected parent, not once per function. It is
+    // intentionally named affected-parent bytes and must not be summed with
+    // per-reason function counts.
+    affectedParentCandidateBytes += r.candidateFunctionBytes;
+    for (const RISCVFallthroughAudit &a : r.fallthroughAudits) {
+      ++fallthroughRanges;
+      ++reasonCounts[static_cast<size_t>(a.reason)];
+      if (a.symbolBoundarySuspicious)
+        ++symbolBoundarySuspiciousFunctions;
+      message(Twine("riscv-function-sections-split: fallthrough audit: "
+                    "object file ") +
+              toString(r.parent->file) + " parent " + r.parent->name +
+              " function " + a.functionName + " range [" +
+              Twine(a.rangeBegin) + "," + Twine(a.rangeEnd) + ") size " +
+              Twine(a.rangeEnd - a.rangeBegin) + " range start " +
+              Twine(a.rangeBegin) + " range end " + Twine(a.rangeEnd) +
+              " next function " + a.nextFunctionName + " next start " +
+              Twine(a.nextFunctionStart) + " adjacent-next " +
+              yesNo(a.adjacentToNextFunction) + " last-function " +
+              yesNo(a.lastFunction) + " range-end-parent-end " +
+              yesNo(a.rangeEndIsParentEnd) + " symbol boundary suspicious " +
+              yesNo(a.symbolBoundarySuspicious) + " symbol boundary detail " +
+              a.symbolBoundaryDetail + " reason " +
+              fallthroughReasonToString(a.reason));
+      printInsn("last instruction", a.lastInsn);
+      message(Twine("riscv-function-sections-split: fallthrough audit: "
+                    "last instruction end ") +
+              Twine(a.lastInsnEnd) + " trailing bytes after last " +
+              Twine(a.trailingBytesAfterLastInsn) +
+              " truncated trailing bytes " +
+              yesNo(a.hasTruncatedTrailingBytes) + " tail16 " +
+              a.tailBytesHex);
+      printInsn("terminal instruction", a.terminalInsn);
+      message(Twine("riscv-function-sections-split: fallthrough audit: "
+                    "terminal exists ") +
+              yesNo(a.hasTerminal) + " terminal kind " + a.terminalKind +
+              " trailing bytes after terminal " +
+              Twine(a.trailingBytesAfterTerminal) + " trailing zero " +
+              yesNo(a.terminalTrailingAllZero) + " trailing nop " +
+              yesNo(a.terminalTrailingNop) + " trailing align " +
+              yesNo(a.terminalTrailingAlign) + " trailing known padding " +
+              yesNo(a.terminalTrailingKnownPadding));
+    }
+  }
+
+  message(Twine("riscv-function-sections-split: fallthrough summary: "
+                "fallthrough function range count: ") +
+          Twine(fallthroughRanges));
+  message(Twine("riscv-function-sections-split: fallthrough summary: "
+                "affected parent count: ") +
+          Twine(affectedParents));
+  message(Twine("riscv-function-sections-split: fallthrough summary: "
+                "affected multi-function parent count: ") +
+          Twine(affectedMultiFunctionParents));
+  message(Twine("riscv-function-sections-split: fallthrough summary: "
+                "affected-parent candidate bytes: ") +
+          Twine(affectedParentCandidateBytes));
+  message(Twine("riscv-function-sections-split: fallthrough summary: "
+                "symbol-boundary-suspicious function count: ") +
+          Twine(symbolBoundarySuspiciousFunctions));
+  for (size_t i = 0; i != reasonCounts.size(); ++i)
+    message(Twine("riscv-function-sections-split: fallthrough summary: ") +
+            fallthroughReasonToString(static_cast<RISCVFallthroughReason>(i)) +
+            " count: " + Twine(reasonCounts[i]));
+}
+
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   riscvFunctionSplitChildren.clear();
   riscvFunctionSplitRelocStorage.clear();
@@ -4451,6 +5013,7 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
       message(Twine("riscv-function-sections-split: summary: ") +
               blockReasonToString(static_cast<RISCVFunctionSplitBlockReason>(i)) + ": " +
               Twine(reasonCounts[i]));
+  printRISCVFunctionSplitFallthroughAudits(results);
   message(Twine("riscv-function-sections-split: phase1a: split parent count: ") +
           Twine(splitStats.splitParentCount));
   message(Twine("riscv-function-sections-split: phase1a: skipped safe single-function parent count: ") +
