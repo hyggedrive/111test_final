@@ -756,6 +756,33 @@ static void relaxCall(const InputSection &sec, size_t i, uint64_t loc,
   }
 }
 
+// Relax R_RISCV_JAL to c.j or c.jal. C.JAL is only available in RV32C.
+static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
+                          Relocation &r, uint32_t &remove) {
+  if (!(config->eflags & EF_RISCV_RVC))
+    return;
+
+  const uint32_t insn = read32le(sec.content().data() + r.offset);
+  if ((insn & 0x7f) != 0x6f)
+    return;
+
+  const uint32_t rd = extractBits(insn, 11, 7);
+  if (rd != 0 && rd != X_RA)
+    return;
+  if (rd == X_RA && config->is64)
+    return;
+
+  const uint64_t dest = r.sym->getVA(r.addend);
+  const int64_t displace =
+      static_cast<int64_t>(dest) - static_cast<int64_t>(loc);
+  if (!isInt<12>(displace) || (displace & 1))
+    return;
+
+  sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+  sec.relaxAux->writes.push_back(rd == 0 ? 0xa001 : 0x2001);
+  remove = 2;
+}
+
 // Relax local-exec TLS when hi20 is zero.
 static void relaxTlsLe(const InputSection &sec, size_t i, uint64_t loc,
                        Relocation &r, uint32_t &remove) {
@@ -836,6 +863,11 @@ static bool relax(InputSection &sec) {
       if (i + 1 != sec.relocs().size() &&
           sec.relocs()[i + 1].type == R_RISCV_RELAX)
         relaxCall(sec, i, loc, r, remove);
+      break;
+    case R_RISCV_JAL:
+      if (i + 1 != sec.relocs().size() &&
+          sec.relocs()[i + 1].type == R_RISCV_RELAX)
+        relaxJalToRVC(sec, i, loc, r, remove);
       break;
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD:
