@@ -2902,6 +2902,16 @@ enum class RISCVNoreturnProofStatus {
   TargetEndsInNoreturnCandidateCall,
   KnownNameOnly,
   ConservativelyProven,
+  ReachableReturn,
+  ReachableIndirectControlFlow,
+  ReachableUnknownInstruction,
+  ReachableOutOfRangeTarget,
+  UnresolvedDirectTarget,
+  ReachableFalloffEnd,
+  InvalidInstructionBoundary,
+  UnprovenDirectCall,
+  RecursiveCallCycle,
+  DepthLimit,
   NotProven,
   Count,
 };
@@ -2943,6 +2953,26 @@ noreturnProofStatusToString(RISCVNoreturnProofStatus status) {
     return "known-name-only";
   case RISCVNoreturnProofStatus::ConservativelyProven:
     return "conservatively-proven";
+  case RISCVNoreturnProofStatus::ReachableReturn:
+    return "reachable-return";
+  case RISCVNoreturnProofStatus::ReachableIndirectControlFlow:
+    return "reachable-indirect-control-flow";
+  case RISCVNoreturnProofStatus::ReachableUnknownInstruction:
+    return "reachable-unknown-instruction";
+  case RISCVNoreturnProofStatus::ReachableOutOfRangeTarget:
+    return "reachable-out-of-range-target";
+  case RISCVNoreturnProofStatus::UnresolvedDirectTarget:
+    return "unresolved-direct-target";
+  case RISCVNoreturnProofStatus::ReachableFalloffEnd:
+    return "reachable-falloff-end";
+  case RISCVNoreturnProofStatus::InvalidInstructionBoundary:
+    return "invalid-instruction-boundary";
+  case RISCVNoreturnProofStatus::UnprovenDirectCall:
+    return "unproven-direct-call";
+  case RISCVNoreturnProofStatus::RecursiveCallCycle:
+    return "recursive-call-cycle";
+  case RISCVNoreturnProofStatus::DepthLimit:
+    return "depth-limit";
   case RISCVNoreturnProofStatus::NotProven:
     return "not-proven";
   case RISCVNoreturnProofStatus::Count:
@@ -3013,6 +3043,43 @@ struct RISCVTargetFunctionAudit {
   RelType finalDirectCallRelocationType = R_NONE;
 };
 
+struct RISCVNoreturnCFGInsnAudit {
+  uint64_t offset = 0;
+  uint32_t raw = 0;
+  uint8_t width = 0;
+  std::string insnClass = "unknown";
+  int64_t target = -1;
+  uint64_t resolvedTargetOffset = 0;
+  std::string targetSource = "none";
+  RelType relocationType = R_NONE;
+  std::string relocationSymbol = "<none>";
+  int64_t relocationAddend = 0;
+  bool targetInRange = false;
+  bool targetValidBoundary = false;
+  uint32_t successorCount = 0;
+};
+
+struct RISCVNoreturnCFGResult {
+  bool analyzed = false;
+  bool conservativelyProven = false;
+  std::string reason = "not-analyzed";
+  RISCVNoreturnProofStatus status = RISCVNoreturnProofStatus::NotAnalyzed;
+  uint64_t reachableInstructionCount = 0;
+  uint64_t reachableReturnCount = 0;
+  uint64_t reachableIndirectJumpCount = 0;
+  uint64_t reachableUnknownCount = 0;
+  uint64_t reachableOutOfRangeTargetCount = 0;
+  uint64_t reachableUnresolvedDirectTargetCount = 0;
+  uint64_t reachableDirectCallCount = 0;
+  uint64_t reachableProvenNoreturnCallCount = 0;
+  bool hasInternalCycle = false;
+  bool hasSelfLoop = false;
+  bool hasReachableFalloffEnd = false;
+  bool hasUnexplainedReachableSink = false;
+  SmallVector<uint64_t, 0> reachableOffsets;
+  SmallVector<RISCVNoreturnCFGInsnAudit, 0> controlInsns;
+};
+
 struct RISCVNoreturnDirectCallAudit {
   std::string objectFile;
   std::string parentSection;
@@ -3045,7 +3112,9 @@ struct RISCVNoreturnDirectCallAudit {
   uint64_t targetRangeBegin = 0;
   uint64_t targetRangeEnd = 0;
   bool knownNoreturnNameCandidate = false;
+  bool hasCandidateNoreturnChain = false;
   RISCVTargetFunctionAudit targetAudit;
+  RISCVNoreturnCFGResult cfg;
   RISCVNoreturnProofStatus proofStatus =
       RISCVNoreturnProofStatus::NotAnalyzed;
   std::string proofReason = "not-analyzed";
@@ -3357,6 +3426,10 @@ static bool isKnownNoreturnNameCandidate(StringRef name) {
          name == "quick_exit";
 }
 
+static std::string relocTypeOrNone(RelType type) {
+  return type == R_NONE ? std::string("none") : toString(type);
+}
+
 static uint32_t bits(uint32_t v, unsigned hi, unsigned lo) {
   return (v >> lo) & ((1u << (hi - lo + 1)) - 1);
 }
@@ -3644,6 +3717,447 @@ analyzeRISCVTargetFunction(InputSection &sec, uint64_t begin, uint64_t end) {
   return audit;
 }
 
+template <class ELFT>
+static RISCVNoreturnCFGResult
+proveRISCVNoreturnCFG(Symbol *sym,
+                      DenseMap<Symbol *, RISCVNoreturnCFGResult> &cache,
+                      DenseSet<Symbol *> &stack, unsigned depth) {
+  RISCVNoreturnCFGResult result;
+  result.analyzed = true;
+  if (!sym) {
+    result.status = RISCVNoreturnProofStatus::NoTargetRelocation;
+    result.reason = "missing-target";
+    return result;
+  }
+  if (auto it = cache.find(sym); it != cache.end())
+    return it->second;
+  if (depth >= 8) {
+    result.status = RISCVNoreturnProofStatus::DepthLimit;
+    result.reason = "depth-limit";
+    return result;
+  }
+  if (!stack.insert(sym).second) {
+    result.status = RISCVNoreturnProofStatus::RecursiveCallCycle;
+    result.reason = "recursive-call-cycle-not-proven";
+    return result;
+  }
+  auto finish = [&](RISCVNoreturnProofStatus status, StringRef reason) {
+    result.status = status;
+    result.reason = reason.str();
+    result.conservativelyProven =
+        status == RISCVNoreturnProofStatus::ConservativelyProven;
+    stack.erase(sym);
+    cache[sym] = result;
+    return result;
+  };
+
+  if (sym->isUndefined())
+    return finish(RISCVNoreturnProofStatus::UndefinedTarget,
+                  "undefined-target");
+  if (sym->isShared())
+    return finish(RISCVNoreturnProofStatus::SharedTarget, "shared-target");
+  if (sym->isLazy())
+    return finish(RISCVNoreturnProofStatus::LazyTarget, "lazy-target");
+  if (sym->isPreemptible)
+    return finish(RISCVNoreturnProofStatus::PreemptibleTarget,
+                  "preemptible-target");
+  auto *d = dyn_cast<Defined>(sym);
+  if (!d || !d->isFunc())
+    return finish(RISCVNoreturnProofStatus::NonFunctionTarget,
+                  "non-function-target");
+  auto *sec = dyn_cast_or_null<InputSection>(d->section);
+  if (!sec || d->size == 0 ||
+      d->size > std::numeric_limits<uint64_t>::max() - d->value ||
+      d->value + d->size > sec->content().size())
+    return finish(RISCVNoreturnProofStatus::TargetRangeUnavailable,
+                  "target-range-unavailable");
+
+  uint64_t begin = d->value;
+  uint64_t end = d->value + d->size;
+  ArrayRef<uint8_t> data = sec->content();
+  const bool rvc =
+      cast<ObjFile<ELFT>>(sec->file)->getObj().getHeader().e_flags &
+      EF_RISCV_RVC;
+
+  struct Insn {
+    uint64_t off = 0;
+    uint32_t raw = 0;
+    uint8_t width = 0;
+    std::string cls = "unknown";
+    SmallVector<uint64_t, 2> successors;
+    int64_t target = -1;
+    Symbol *callTarget = nullptr;
+    bool directCall = false;
+    bool provenCall = false;
+    bool isReturn = false;
+    bool isIndirect = false;
+    bool isUnknown = false;
+    bool unresolvedDirectTarget = false;
+    bool unprovenDirectCallSink = false;
+    std::string targetSource = "none";
+    RelType relocationType = R_NONE;
+    std::string relocationSymbol = "<none>";
+    int64_t relocationAddend = 0;
+  };
+  auto findDirectTarget = [&](uint64_t off,
+                              std::initializer_list<RelType> relocTypes,
+                              int64_t rawTarget, Insn &insn) {
+    struct DirectTarget {
+      bool resolved = false;
+      bool sawReloc = false;
+      bool ambiguous = false;
+      uint64_t offset = 0;
+    } target;
+    auto scan = [&](auto rels) {
+      for (const auto &rel : rels) {
+        RelType type = rel.getType(config->isMips64EL);
+        if (rel.r_offset != off || !llvm::is_contained(relocTypes, type))
+          continue;
+        if (target.sawReloc) {
+          target.ambiguous = true;
+          continue;
+        }
+        target.sawReloc = true;
+        insn.targetSource = "relocation";
+        insn.relocationType = type;
+        insn.relocationAddend = getRISCVFunctionSplitAddend(rel);
+        if (rel.getSymbol(config->isMips64EL) == 0)
+          continue;
+        Symbol &sym = sec->getFile<ELFT>()->getRelocTargetSym(rel);
+        insn.relocationSymbol = toString(sym);
+        auto *targetDef = dyn_cast<Defined>(&sym);
+        if (!targetDef || targetDef->section != sec)
+          continue;
+        uint64_t resolved = 0;
+        if (!checkedAddend(targetDef->value, insn.relocationAddend, resolved))
+          continue;
+        target.resolved = true;
+        target.offset = resolved;
+      }
+    };
+    RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+    if (rels.areRelocsRel())
+      scan(rels.rels);
+    else
+      scan(rels.relas);
+    if (target.ambiguous || (target.sawReloc && !target.resolved)) {
+      insn.unresolvedDirectTarget = true;
+      return false;
+    }
+    if (target.sawReloc) {
+      insn.target = static_cast<int64_t>(target.offset);
+      return true;
+    }
+    insn.targetSource = "raw-immediate";
+    insn.target = rawTarget;
+    if (rawTarget < 0) {
+      insn.unresolvedDirectTarget = true;
+      return false;
+    }
+    return true;
+  };
+  DenseMap<uint64_t, Insn> insns;
+  DenseSet<uint64_t> boundaries;
+  bool decodeFailed = false;
+  for (uint64_t off = begin; off < end;) {
+    boundaries.insert(off);
+    Insn insn;
+    insn.off = off;
+    if (off + 2 > end) {
+      decodeFailed = true;
+      break;
+    }
+    uint16_t half = llvm::support::endian::read16le(data.data() + off);
+    if ((half & 3) != 3) {
+      insn.raw = half;
+      insn.width = 16;
+      uint16_t op = half & 3, funct3 = bits(half, 15, 13);
+      if (!rvc) {
+        insn.cls = "unknown";
+        insn.isUnknown = true;
+      } else if (op == 1 && funct3 == 5) {
+        insn.cls = "unconditional-jump";
+        if (findDirectTarget(off, {R_RISCV_RVC_JUMP},
+                             static_cast<int64_t>(off) + decodeCJ(half),
+                             insn))
+          insn.successors.push_back(static_cast<uint64_t>(insn.target));
+      } else if (op == 1 && funct3 == 1) {
+        insn.cls = "direct-call";
+        if (off + 2 == end)
+          insn.unprovenDirectCallSink = true;
+        else
+          insn.successors.push_back(off + 2);
+      } else if (op == 1 && (funct3 == 6 || funct3 == 7)) {
+        insn.cls = "conditional-branch";
+        if (findDirectTarget(off, {R_RISCV_RVC_BRANCH},
+                             static_cast<int64_t>(off) + decodeCB(half),
+                             insn))
+          insn.successors.push_back(static_cast<uint64_t>(insn.target));
+        insn.successors.push_back(off + 2);
+      } else if (op == 2 && funct3 == 4 && bits(half, 6, 2) == 0) {
+        uint32_t rs1 = bits(half, 11, 7);
+        bool link = bits(half, 12, 12);
+        if (!link && rs1 == 1) {
+          insn.cls = "return";
+          insn.isReturn = true;
+        } else {
+          insn.cls = link ? "indirect-call" : "indirect-jump";
+          insn.isIndirect = rs1 != 0;
+          if (rs1 == 0) {
+            insn.cls = link ? "compressed-ebreak" : "compressed-reserved";
+            if (link)
+              insn.successors.push_back(off + 2);
+            else
+              insn.isUnknown = true;
+          }
+        }
+      } else {
+        insn.cls = half == 0x0001 ? "nop" : "non-terminal";
+        // The proof-only CFG must not treat reserved compressed encodings as
+        // ordinary fallthrough. Keep the whitelist intentionally small.
+        if (half == 0x0001)
+          insn.successors.push_back(off + 2);
+        else {
+          insn.cls = "unknown";
+          insn.isUnknown = true;
+        }
+      }
+      insns[off] = std::move(insn);
+      off += 2;
+      continue;
+    }
+
+    if (off + 4 > end) {
+      decodeFailed = true;
+      break;
+    }
+    uint32_t word = llvm::support::endian::read32le(data.data() + off);
+    uint32_t opcode = word & 0x7f;
+    insn.raw = word;
+    insn.width = 32;
+    if (opcode == 0x17 && off + 4 < end) {
+      uint32_t next = llvm::support::endian::read32le(data.data() + off + 4);
+      RelType relType = R_NONE;
+      if ((next & 0x7f) == 0x67) {
+        Symbol *target = findRISCVCallRelocTarget<ELFT>(*sec, off, relType);
+        if (target) {
+          uint32_t jalrRd = bits(next, 11, 7);
+          insn.off = off + 4;
+          insn.raw = next;
+          insn.width = 32;
+          insn.cls = jalrRd == 0 ? "indirect-jump" : "direct-call";
+          insn.directCall = jalrRd != 0;
+          insn.callTarget = target;
+          if (jalrRd == 0)
+            insn.isIndirect = true;
+          else {
+            RISCVNoreturnCFGResult callee =
+                proveRISCVNoreturnCFG<ELFT>(target, cache, stack, depth + 1);
+            if (callee.conservativelyProven)
+              insn.provenCall = true;
+            else if (off + 8 == end)
+              insn.unprovenDirectCallSink = true;
+            else
+              insn.successors.push_back(off + 8);
+          }
+          insns[off] = std::move(insn);
+          off += 8;
+          continue;
+        }
+      }
+    }
+    if (opcode == 0x6f) {
+      uint32_t rd = bits(word, 11, 7);
+      insn.cls = rd == 0 ? "unconditional-jump" : "direct-call";
+      if (!findDirectTarget(off, {R_RISCV_JAL},
+                            static_cast<int64_t>(off) + decodeJal(word),
+                            insn)) {
+      } else if (rd == 0)
+        insn.successors.push_back(static_cast<uint64_t>(insn.target));
+      else if (off + 4 == end)
+        insn.unprovenDirectCallSink = true;
+      else
+        insn.successors.push_back(off + 4);
+    } else if (opcode == 0x63) {
+      insn.cls = "conditional-branch";
+      if (findDirectTarget(off, {R_RISCV_BRANCH},
+                           static_cast<int64_t>(off) + decodeBranch(word),
+                           insn))
+        insn.successors.push_back(static_cast<uint64_t>(insn.target));
+      insn.successors.push_back(off + 4);
+    } else if (opcode == 0x67) {
+      uint32_t rd = bits(word, 11, 7);
+      uint32_t rs1 = bits(word, 19, 15);
+      int64_t imm = SignExtend64<12>(bits(word, 31, 20));
+      if (rd == 0 && rs1 == 1 && imm == 0) {
+        insn.cls = "return";
+        insn.isReturn = true;
+      } else {
+        insn.cls = rd == 0 ? "indirect-jump" : "indirect-call";
+        insn.isIndirect = true;
+      }
+    } else if (opcode == 0x73) {
+      uint32_t funct3 = bits(word, 14, 12);
+      if (word == 0x00000073) {
+        insn.cls = "ecall";
+        insn.successors.push_back(off + 4);
+      } else if (word == 0x00100073) {
+        insn.cls = "ebreak";
+        insn.successors.push_back(off + 4);
+      } else if (word == 0x30200073 || word == 0x10200073 ||
+                 word == 0x00200073) {
+        insn.cls = "system-return";
+        insn.isIndirect = true;
+      } else if (funct3 != 0) {
+        insn.cls = "csr";
+        insn.successors.push_back(off + 4);
+      } else {
+        insn.cls = "unknown-system";
+        insn.isUnknown = true;
+      }
+    } else {
+      switch (opcode) {
+      case 0x03:
+      case 0x0f:
+      case 0x13:
+      case 0x17:
+      case 0x23:
+      case 0x33:
+      case 0x37:
+      case 0x53:
+        insn.cls = "non-terminal";
+        insn.successors.push_back(off + 4);
+        break;
+      default:
+        insn.cls = "unknown";
+        insn.isUnknown = true;
+        break;
+      }
+    }
+    insns[off] = std::move(insn);
+    off += 4;
+  }
+  boundaries.insert(end);
+  if (decodeFailed)
+    return finish(RISCVNoreturnProofStatus::InvalidInstructionBoundary,
+                  "invalid-instruction-boundary");
+
+  SmallVector<uint64_t, 0> worklist;
+  DenseSet<uint64_t> seen;
+  worklist.push_back(begin);
+  bool hasTerminatingNoreturnCall = false;
+  auto recordControlInsn = [&](const Insn &insn) {
+    if (insn.cls == "non-terminal" || insn.cls == "nop" ||
+        insn.cls == "ecall" || insn.cls == "ebreak" ||
+        insn.cls == "csr")
+      return;
+    RISCVNoreturnCFGInsnAudit auditInsn;
+    auditInsn.offset = insn.off;
+    auditInsn.raw = insn.raw;
+    auditInsn.width = insn.width;
+    auditInsn.insnClass = insn.cls;
+    auditInsn.target = insn.target;
+    auditInsn.resolvedTargetOffset =
+        insn.target >= 0 ? static_cast<uint64_t>(insn.target) : 0;
+    auditInsn.targetSource = insn.targetSource;
+    auditInsn.relocationType = insn.relocationType;
+    auditInsn.relocationSymbol = insn.relocationSymbol;
+    auditInsn.relocationAddend = insn.relocationAddend;
+    auditInsn.targetInRange =
+        insn.target >= 0 && begin <= static_cast<uint64_t>(insn.target) &&
+        static_cast<uint64_t>(insn.target) < end;
+    auditInsn.targetValidBoundary =
+        insn.target >= 0 &&
+        boundaries.contains(static_cast<uint64_t>(insn.target));
+    auditInsn.successorCount = insn.successors.size();
+    result.controlInsns.push_back(std::move(auditInsn));
+  };
+  while (!worklist.empty()) {
+    uint64_t off = worklist.back();
+    worklist.pop_back();
+    if (!seen.insert(off).second)
+      continue;
+    if (off == end) {
+      result.hasReachableFalloffEnd = true;
+      return finish(RISCVNoreturnProofStatus::ReachableFalloffEnd,
+                    "reachable-falloff-end");
+    }
+    auto it = insns.find(off);
+    if (it == insns.end())
+      return finish(RISCVNoreturnProofStatus::InvalidInstructionBoundary,
+                    "invalid-instruction-boundary");
+    const Insn &insn = it->second;
+    result.reachableOffsets.push_back(off);
+    ++result.reachableInstructionCount;
+    recordControlInsn(insn);
+    if (insn.unresolvedDirectTarget) {
+      ++result.reachableUnresolvedDirectTargetCount;
+      return finish(RISCVNoreturnProofStatus::UnresolvedDirectTarget,
+                    "unresolved-direct-target");
+    }
+    if (insn.isReturn) {
+      ++result.reachableReturnCount;
+      return finish(RISCVNoreturnProofStatus::ReachableReturn,
+                    "reachable-return");
+    }
+    if (insn.isIndirect) {
+      ++result.reachableIndirectJumpCount;
+      return finish(RISCVNoreturnProofStatus::ReachableIndirectControlFlow,
+                    "reachable-indirect-control-flow");
+    }
+    if (insn.isUnknown) {
+      ++result.reachableUnknownCount;
+      return finish(RISCVNoreturnProofStatus::ReachableUnknownInstruction,
+                    "reachable-unknown-instruction");
+    }
+    if (insn.directCall) {
+      ++result.reachableDirectCallCount;
+      if (insn.provenCall) {
+        ++result.reachableProvenNoreturnCallCount;
+        hasTerminatingNoreturnCall = true;
+      }
+    }
+    if (insn.unprovenDirectCallSink) {
+      result.hasUnexplainedReachableSink = true;
+      return finish(RISCVNoreturnProofStatus::UnprovenDirectCall,
+                    "unproven-direct-call");
+    }
+    if (insn.successors.empty() && !insn.provenCall) {
+      result.hasUnexplainedReachableSink = true;
+      return finish(RISCVNoreturnProofStatus::NotProven,
+                    "unexplained-reachable-sink");
+    }
+    for (uint64_t succ : insn.successors) {
+      if (succ < begin || succ > end) {
+        ++result.reachableOutOfRangeTargetCount;
+        return finish(RISCVNoreturnProofStatus::ReachableOutOfRangeTarget,
+                      "reachable-out-of-range-target");
+      }
+      if (!boundaries.contains(succ))
+        return finish(RISCVNoreturnProofStatus::InvalidInstructionBoundary,
+                      "invalid-instruction-boundary");
+      if (succ == off)
+        result.hasSelfLoop = true;
+      if (succ <= off)
+        result.hasInternalCycle = true;
+      worklist.push_back(succ);
+    }
+  }
+  if (result.hasUnexplainedReachableSink)
+    return finish(RISCVNoreturnProofStatus::NotProven,
+                  "unexplained-reachable-sink");
+  if (result.hasSelfLoop)
+    return finish(RISCVNoreturnProofStatus::ConservativelyProven,
+                  "reachable-internal-self-loop-no-return");
+  if (result.hasInternalCycle)
+    return finish(RISCVNoreturnProofStatus::ConservativelyProven,
+                  "reachable-internal-cycle-no-return");
+  if (hasTerminatingNoreturnCall)
+    return finish(RISCVNoreturnProofStatus::ConservativelyProven,
+                  "all-reachable-paths-end-in-proven-noreturn-call");
+  return finish(RISCVNoreturnProofStatus::NotProven, "not-proven");
+}
+
 template <class RelTy>
 static void recordIncomingRelocAudit(InputSection &parent,
                                      ArrayRef<RISCVFunctionRange> ranges,
@@ -3850,7 +4364,10 @@ static void auditSourceRelocs(InputSection &sec,
   }
 
   SmallVector<std::string, 0> functionNames;
+  std::optional<DenseMap<Symbol *, RISCVNoreturnCFGResult>>
+      noreturnCFGCache;
   if (collectFallthroughAudit) {
+    noreturnCFGCache.emplace();
     functionNames.resize(ranges.size(), "<none>");
     auto *file = cast<ObjFile<ELFT>>(sec.file);
     for (Symbol *sym : file->getSymbols()) {
@@ -4182,34 +4699,46 @@ static void auditSourceRelocs(InputSection &sec,
       } else if (!audit.targetRangeFound) {
         audit.proofStatus = RISCVNoreturnProofStatus::TargetRangeUnavailable;
         audit.proofReason = "target-range-unavailable";
-      } else if (audit.targetAudit.returnCount != 0) {
-        audit.proofStatus = RISCVNoreturnProofStatus::TargetContainsReturn;
-        audit.proofReason = "target-contains-return";
-      } else if (audit.targetAudit.finalInsn.insnClass == "return") {
-        audit.proofStatus = RISCVNoreturnProofStatus::TargetEndsInReturn;
-        audit.proofReason = "target-ends-in-return";
-      } else if (audit.targetAudit.finalInsn.insnClass == "indirect-jump") {
-        audit.proofStatus = RISCVNoreturnProofStatus::TargetEndsInIndirectJump;
-        audit.proofReason = "target-ends-in-indirect-jump";
-      } else if (audit.targetAudit.finalInsn.insnClass == "direct-call") {
-        audit.proofStatus = isKnownNoreturnNameCandidate(
-                                audit.targetAudit.finalDirectCallTarget)
-                                ? RISCVNoreturnProofStatus::
-                                      TargetEndsInNoreturnCandidateCall
-                                : RISCVNoreturnProofStatus::
-                                      TargetEndsInDirectCall;
-        audit.proofReason = "target-ends-in-direct-call-full-cfg-required";
-      } else if (audit.targetAudit.finalInsn.insnClass == "unknown" ||
-                 audit.targetAudit.finalInsn.insnClass == "unknown-system") {
-        audit.proofStatus =
-            RISCVNoreturnProofStatus::TargetEndsInUnknownInstruction;
-        audit.proofReason = "target-ends-in-unknown-instruction";
-      } else if (audit.knownNoreturnNameCandidate) {
-        audit.proofStatus = RISCVNoreturnProofStatus::KnownNameOnly;
-        audit.proofReason = "known-name-candidate-not-proof";
       } else {
-        audit.proofStatus = RISCVNoreturnProofStatus::NotProven;
-        audit.proofReason = "full-cfg-required";
+        if (audit.targetAudit.finalInsn.insnClass == "direct-call")
+          audit.hasCandidateNoreturnChain =
+              isKnownNoreturnNameCandidate(
+                  audit.targetAudit.finalDirectCallTarget);
+        if (audit.cfg.conservativelyProven) {
+          audit.proofStatus = RISCVNoreturnProofStatus::ConservativelyProven;
+          audit.proofReason = audit.cfg.reason;
+        } else if (audit.cfg.analyzed) {
+          audit.proofStatus = audit.cfg.status;
+          audit.proofReason = audit.cfg.reason;
+        } else if (audit.targetAudit.finalInsn.insnClass == "direct-call") {
+          audit.proofStatus = audit.hasCandidateNoreturnChain
+                                  ? RISCVNoreturnProofStatus::
+                                        TargetEndsInNoreturnCandidateCall
+                                  : RISCVNoreturnProofStatus::
+                                        TargetEndsInDirectCall;
+          audit.proofReason = "target-ends-in-direct-call-full-cfg-required";
+        } else if (audit.targetAudit.returnCount != 0) {
+          audit.proofStatus = RISCVNoreturnProofStatus::TargetContainsReturn;
+          audit.proofReason = "target-contains-return";
+        } else if (audit.targetAudit.finalInsn.insnClass == "return") {
+          audit.proofStatus = RISCVNoreturnProofStatus::TargetEndsInReturn;
+          audit.proofReason = "target-ends-in-return";
+        } else if (audit.targetAudit.finalInsn.insnClass == "indirect-jump") {
+          audit.proofStatus =
+              RISCVNoreturnProofStatus::TargetEndsInIndirectJump;
+          audit.proofReason = "target-ends-in-indirect-jump";
+        } else if (audit.targetAudit.finalInsn.insnClass == "unknown" ||
+                   audit.targetAudit.finalInsn.insnClass == "unknown-system") {
+          audit.proofStatus =
+              RISCVNoreturnProofStatus::TargetEndsInUnknownInstruction;
+          audit.proofReason = "target-ends-in-unknown-instruction";
+        } else if (audit.knownNoreturnNameCandidate) {
+          audit.proofStatus = RISCVNoreturnProofStatus::KnownNameOnly;
+          audit.proofReason = "known-name-candidate-not-proof";
+        } else {
+          audit.proofStatus = RISCVNoreturnProofStatus::NotProven;
+          audit.proofReason = "full-cfg-required";
+        }
       }
     };
 
@@ -4272,7 +4801,8 @@ static void auditSourceRelocs(InputSection &sec,
         std::string callee = next ? toString(*next) : "<none>";
         audit.chain.push_back(
             (Twine("depth ") + Twine(depth) + " caller " + toString(*cur) +
-             " callee " + callee + " relocation type " + toString(nextRel) +
+             " callee " + callee + " relocation type " +
+             relocTypeOrNone(nextRel) +
              " resolved file " + file + " resolved section " + section +
              " reason " + reason)
                 .str());
@@ -4315,6 +4845,9 @@ static void auditSourceRelocs(InputSection &sec,
       }
       if (target) {
         fillTargetSymbol(audit, *target);
+        DenseSet<Symbol *> stack;
+        audit.cfg = proveRISCVNoreturnCFG<ELFT>(
+            target, *noreturnCFGCache, stack, 0);
         setProofStatus(audit);
         appendNoreturnChain(audit, target);
       } else if (sawSymbolZero) {
@@ -5472,7 +6005,7 @@ static void printRISCVFunctionSplitNoreturnAudits(
   uint64_t affectedParentCandidateBytes = 0;
   uint64_t definedTargets = 0, undefinedTargets = 0, sharedTargets = 0;
   uint64_t lazyTargets = 0, preemptibleTargets = 0, nonFunctionTargets = 0;
-  uint64_t targetRangeFound = 0;
+  uint64_t targetRangeFound = 0, candidateChains = 0;
   auto yesNo = [](bool v) -> StringRef { return v ? "yes" : "no"; };
 
   for (const RISCVFunctionSplitAuditResult &r : results) {
@@ -5501,6 +6034,8 @@ static void printRISCVFunctionSplitNoreturnAudits(
         ++nonFunctionTargets;
       if (a.targetRangeFound)
         ++targetRangeFound;
+      if (a.hasCandidateNoreturnChain)
+        ++candidateChains;
 
       message(Twine("riscv-function-sections-split: noreturn audit: "
                     "object file ") +
@@ -5525,7 +6060,9 @@ static void printRISCVFunctionSplitNoreturnAudits(
               Twine(a.targetSize) + " target range found " +
               yesNo(a.targetRangeFound) +
               " known noreturn name candidate " +
-              yesNo(a.knownNoreturnNameCandidate) + " proof status " +
+              yesNo(a.knownNoreturnNameCandidate) +
+              " candidate noreturn chain " +
+              yesNo(a.hasCandidateNoreturnChain) + " proof status " +
               noreturnProofStatusToString(a.proofStatus) + " proof reason " +
               a.proofReason);
       message(Twine("riscv-function-sections-split: noreturn audit: "
@@ -5546,12 +6083,61 @@ static void printRISCVFunctionSplitNoreturnAudits(
               yesNo(a.targetAudit.finalInsn.partOfCallPair) +
               " target final direct-call target " +
               a.targetAudit.finalDirectCallTarget + " target final relocation " +
-              toString(a.targetAudit.finalDirectCallRelocationType));
+              relocTypeOrNone(a.targetAudit.finalDirectCallRelocationType));
+      message(Twine("riscv-function-sections-split: noreturn cfg: target ") +
+              a.resolvedTargetName + " target file " + a.resolvedTargetFile +
+              " target section " + a.resolvedTargetSection + " range [" +
+              Twine(a.targetRangeBegin) + "," + Twine(a.targetRangeEnd) +
+              ") entry " + Twine(a.targetRangeBegin) +
+              " reachable instruction count " +
+              Twine(a.cfg.reachableInstructionCount) +
+              " reachable return count " +
+              Twine(a.cfg.reachableReturnCount) +
+              " reachable indirect count " +
+              Twine(a.cfg.reachableIndirectJumpCount) +
+              " reachable unknown count " +
+              Twine(a.cfg.reachableUnknownCount) +
+              " reachable out-of-range count " +
+              Twine(a.cfg.reachableOutOfRangeTargetCount) +
+              " reachable unresolved-direct-target count " +
+              Twine(a.cfg.reachableUnresolvedDirectTargetCount) +
+              " reachable direct-call count " +
+              Twine(a.cfg.reachableDirectCallCount) +
+              " reachable proven-noreturn-call count " +
+              Twine(a.cfg.reachableProvenNoreturnCallCount) +
+              " internal cycle " + yesNo(a.cfg.hasInternalCycle) +
+              " self loop " + yesNo(a.cfg.hasSelfLoop) +
+              " falloff end " + yesNo(a.cfg.hasReachableFalloffEnd) +
+              " unexplained sink " + yesNo(a.cfg.hasUnexplainedReachableSink) +
+              " proof status " + noreturnProofStatusToString(a.cfg.status) +
+              " proof reason " + a.cfg.reason);
+      for (const RISCVNoreturnCFGInsnAudit &i : a.cfg.controlInsns) {
+        std::string target =
+            i.target >= 0 ? Twine(i.target).str() : std::string("none");
+        message(Twine("riscv-function-sections-split: noreturn cfg: "
+                      "instruction target ") +
+                a.resolvedTargetName + " offset " + Twine(i.offset) +
+                " raw 0x" + utohexstr(i.raw) + " width " +
+                Twine(static_cast<unsigned>(i.width)) + " class " +
+                i.insnClass + " target " + target + " target in range " +
+                yesNo(i.targetInRange) + " target valid boundary " +
+                yesNo(i.targetValidBoundary) + " target source " +
+                i.targetSource + " relocation type " +
+                relocTypeOrNone(i.relocationType) + " relocation symbol " +
+                i.relocationSymbol + " relocation addend " +
+                Twine(i.relocationAddend) + " resolved target offset " +
+                Twine(i.resolvedTargetOffset) + " successor count " +
+                Twine(i.successorCount));
+      }
       for (StringRef line : a.chain)
         message(Twine("riscv-function-sections-split: noreturn chain: ") +
                 line);
       message(Twine("riscv-function-sections-split: noreturn chain stop: ") +
               a.chainStop);
+      message(Twine("riscv-function-sections-split: noreturn proof: caller ") +
+              a.callerName + " callee " + a.resolvedTargetName +
+              " callee proven " + yesNo(a.cfg.conservativelyProven) +
+              " eligibility changed no");
     }
   }
 
@@ -5597,9 +6183,13 @@ static void printRISCVFunctionSplitNoreturnAudits(
           Twine(statusCounts[static_cast<size_t>(
               RISCVNoreturnProofStatus::ConservativelyProven)]));
   message(Twine("riscv-function-sections-split: noreturn summary: "
+                "candidate-chain count: ") +
+          Twine(candidateChains));
+  message(Twine("riscv-function-sections-split: noreturn summary: "
                 "not-proven count: ") +
-          Twine(statusCounts[static_cast<size_t>(
-              RISCVNoreturnProofStatus::NotProven)]));
+          Twine(auditCount -
+                statusCounts[static_cast<size_t>(
+                    RISCVNoreturnProofStatus::ConservativelyProven)]));
   SmallVector<std::pair<std::string, uint64_t>, 0> reasons;
   for (const auto &it : proofReasonCounts)
     reasons.push_back({it.getKey().str(), it.getValue()});
