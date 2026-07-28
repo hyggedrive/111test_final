@@ -1,6 +1,7 @@
 # REQUIRES: riscv
 
 # RUN: llvm-mc -filetype=obj -triple=riscv32 -mattr=+c %s -o %t.o
+# RUN: ld.lld %t.o -o %t.option-off
 # RUN: ld.lld --riscv-function-sections-split %t.o -o %t.no-print
 # RUN: ld.lld --riscv-function-sections-split \
 # RUN:   --print-riscv-function-sections-split %t.o -o %t.print 2> %t.log
@@ -8,6 +9,11 @@
 # RUN: llvm-readelf -r %t.o | FileCheck %s --check-prefix=RELOCS
 # RUN: FileCheck %s < %t.log
 # RUN: not grep "noreturn audit: .*caller indirect_caller" %t.log
+# RUN: not grep "phase1a: split parent: .*:(.text.addend_case)" %t.log
+# RUN: not grep "phase1a: split parent: .*:(.text.incomplete)" %t.log
+# RUN: not grep "phase1a: split parent: .*:(.text.returning_case)" %t.log
+# RUN: not grep "phase1a: split parent: .*:(.text.known_name_returning_case)" %t.log
+# RUN: not grep "phase1a: split parent: .*:(.text.indirect_case)" %t.log
 
 # RELOCS: R_RISCV_RVC_JUMP
 # RELOCS: R_RISCV_BRANCH
@@ -15,6 +21,28 @@
 
 # CHECK: riscv-function-sections-split: parent section: .text.callers
 # CHECK: riscv-function-sections-split: block reasons: computed-jump,function-fallthrough
+# CHECK: riscv-function-sections-split: parent section: .text.proven
+# CHECK: riscv-function-sections-split: status: safe
+# CHECK: riscv-function-sections-split: parent section: .text.addend_case
+# CHECK: riscv-function-sections-split: block reasons: function-fallthrough
+# CHECK: riscv-function-sections-split: parent section: .text.incomplete
+# CHECK: riscv-function-sections-split: block reasons: computed-jump,function-fallthrough
+# CHECK: riscv-function-sections-split: parent section: .text.returning_case
+# CHECK: riscv-function-sections-split: block reasons: function-fallthrough
+# CHECK: riscv-function-sections-split: parent section: .text.known_name_returning_case
+# CHECK: riscv-function-sections-split: block reasons: function-fallthrough
+# CHECK: riscv-function-sections-split: parent section: .text.indirect_case
+# CHECK: riscv-function-sections-split: block reasons: function-fallthrough
+# CHECK-DAG: riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.proven) size {{[0-9]+}} children 2 relocations {{[0-9]+}}
+# CHECK-DAG: riscv-function-sections-split: phase1a: child range: [0,8)
+# CHECK-DAG: riscv-function-sections-split: phase1a: child range: [8,{{[0-9]+}})
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.proven caller caller_proven callee proven_noreturn_target {{.*}} full call pair yes callee proven yes function-fallthrough suppressed yes eligibility changed yes proof status conservatively-proven
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.addend_case caller caller_nonzero_addend callee proven_noreturn_target {{.*}} call addend 2 full call pair yes callee proven no function-fallthrough suppressed no eligibility changed no proof status not-proven proof reason nonzero-call-addend
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.callers caller call_returns callee returns_target {{.*}} callee proven no function-fallthrough suppressed no eligibility changed no proof status reachable-return
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.callers caller call_known_exit callee exit {{.*}} callee proven no function-fallthrough suppressed no eligibility changed no proof status reachable-return
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.returning_case caller caller_returning callee returning_case_target {{.*}} callee proven no function-fallthrough suppressed no eligibility changed no proof status reachable-return
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.known_name_returning_case caller caller_known_returning callee exit {{.*}} callee proven no function-fallthrough suppressed no eligibility changed no proof status reachable-return
+# CHECK-DAG: noreturn eligibility: object file {{.*}} parent .text.indirect_case caller caller_indirect_case callee indirect_case_target {{.*}} callee proven no function-fallthrough suppressed no eligibility changed no proof status reachable-indirect-control-flow
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_returns {{.*}} relocation target returns_target resolved target returns_target {{.*}} defined yes {{.*}} function yes {{.*}} target range found yes {{.*}} proof status reachable-return
 # CHECK-DAG: noreturn audit: target range [{{[0-9]+}},{{[0-9]+}}) target return count 1
 # CHECK-DAG: noreturn audit: object file {{.*}} parent .text.callers caller call_chain {{.*}} relocation target chain_a resolved target chain_a {{.*}} proof status unproven-direct-call
@@ -75,12 +103,16 @@
 # CHECK-DAG: noreturn summary: conservatively-proven count: {{[1-9][0-9]*}}
 # CHECK-DAG: noreturn summary: candidate-chain count: {{[0-9]+}}
 # CHECK-DAG: noreturn summary: not-proven count: {{[0-9]+}}
+# CHECK-DAG: noreturn summary: noreturn eligibility relaxed range count: {{[1-9][0-9]*}}
+# CHECK-DAG: noreturn summary: noreturn eligibility relaxed parent count: {{[1-9][0-9]*}}
+# CHECK-DAG: noreturn summary: noreturn eligibility relaxed candidate bytes: {{[1-9][0-9]*}}
 
 .globl _start
 .section .text.start,"ax",@progbits
 .type _start,@function
 _start:
   call returns_target
+  call caller_proven
   ret
 .size _start, .-_start
 
@@ -224,12 +256,92 @@ indirect_caller:
   jalr ra, 0(a0)
 .size indirect_caller, .-indirect_caller
 
+.section .text.proven,"ax",@progbits
+.option norvc
+.type caller_proven,@function
+caller_proven:
+  call proven_noreturn_target
+.size caller_proven, .-caller_proven
+
+.type next_function,@function
+next_function:
+  ret
+.size next_function, .-next_function
+
+.section .text.addend_case,"ax",@progbits
+.option norvc
+.type caller_nonzero_addend,@function
+caller_nonzero_addend:
+  auipc ra, 0
+  jalr ra, 0(ra)
+  .reloc caller_nonzero_addend, R_RISCV_CALL, proven_noreturn_target+2
+.size caller_nonzero_addend, .-caller_nonzero_addend
+
+.type next_nonzero_addend,@function
+next_nonzero_addend:
+  ret
+.size next_nonzero_addend, .-next_nonzero_addend
+
+.section .text.incomplete,"ax",@progbits
+.option norvc
+.type caller_no_call_reloc,@function
+caller_no_call_reloc:
+  auipc ra, 0
+  jalr ra, 0(ra)
+.size caller_no_call_reloc, .-caller_no_call_reloc
+
+.type next_no_call_reloc,@function
+next_no_call_reloc:
+  ret
+.size next_no_call_reloc, .-next_no_call_reloc
+
+.section .text.returning_case,"ax",@progbits
+.option norvc
+.type caller_returning,@function
+caller_returning:
+  call returning_case_target
+.size caller_returning, .-caller_returning
+
+.type next_returning,@function
+next_returning:
+  ret
+.size next_returning, .-next_returning
+
+.section .text.known_name_returning_case,"ax",@progbits
+.option norvc
+.type caller_known_returning,@function
+caller_known_returning:
+  call exit
+.size caller_known_returning, .-caller_known_returning
+
+.type next_known_returning,@function
+next_known_returning:
+  ret
+.size next_known_returning, .-next_known_returning
+
+.section .text.indirect_case,"ax",@progbits
+.option norvc
+.type caller_indirect_case,@function
+caller_indirect_case:
+  call indirect_case_target
+.size caller_indirect_case, .-caller_indirect_case
+
+.type next_indirect_case,@function
+next_indirect_case:
+  ret
+.size next_indirect_case, .-next_indirect_case
+
 .section .text.targets,"ax",@progbits
 .option norvc
 .type returns_target,@function
 returns_target:
   ret
 .size returns_target, .-returns_target
+
+.type returning_case_target,@function
+returning_case_target:
+  ret
+.size returning_case_target, .-returning_case_target
 
 .type chain_a,@function
 chain_a:
@@ -251,6 +363,11 @@ call_then_ret_target:
   call chain_b
   ret
 .size call_then_ret_target, .-call_then_ret_target
+
+.type indirect_case_target,@function
+indirect_case_target:
+  jalr zero, 0(a0)
+.size indirect_case_target, .-indirect_case_target
 
 .type cycle_a,@function
 cycle_a:
@@ -301,6 +418,14 @@ known_chain:
 self_loop32:
   jal zero, self_loop32
 .size self_loop32, .-self_loop32
+
+.type proven_noreturn_target,@function
+proven_noreturn_target:
+  addi sp, sp, -16
+1:
+  .word 0x0000006f
+  .reloc 1b, R_RISCV_JAL, 1b
+.size proven_noreturn_target, .-proven_noreturn_target
 
 .option push
 .option rvc

@@ -3122,6 +3122,24 @@ struct RISCVNoreturnDirectCallAudit {
   std::string chainStop = "none";
 };
 
+struct RISCVNoreturnEligibilityAudit {
+  std::string objectFile;
+  std::string parentSection;
+  std::string callerName;
+  std::string calleeName = "<none>";
+  uint64_t callerRangeBegin = 0;
+  uint64_t callerRangeEnd = 0;
+  uint64_t pairStartOffset = 0;
+  int64_t callAddend = 0;
+  bool fullCallPair = false;
+  bool calleeProven = false;
+  bool functionFallthroughSuppressed = false;
+  bool eligibilityChanged = false;
+  RISCVNoreturnProofStatus proofStatus =
+      RISCVNoreturnProofStatus::NotAnalyzed;
+  std::string proofReason = "not-analyzed";
+};
+
 struct RISCVFallthroughAudit {
   std::string functionName;
   std::string nextFunctionName;
@@ -3255,6 +3273,7 @@ struct RISCVFunctionSplitAuditResult {
       debugFallbackRelocCounts = {};
   SmallVector<RISCVFallthroughAudit, 0> fallthroughAudits;
   SmallVector<RISCVNoreturnDirectCallAudit, 0> noreturnDirectCallAudits;
+  SmallVector<RISCVNoreturnEligibilityAudit, 0> noreturnEligibilityAudits;
 };
 
 struct RISCVFunctionSplitDetail {
@@ -4191,6 +4210,122 @@ proveRISCVNoreturnCFG(Symbol *sym,
   return finish(RISCVNoreturnProofStatus::NotProven, "not-proven");
 }
 
+template <class ELFT, class RelTy>
+static bool checkRISCVProvenNoreturnTerminalCall(
+    InputSection &sec, ArrayRef<RelTy> rels, const RISCVFunctionRange &range,
+    uint64_t pairStart, DenseMap<Symbol *, RISCVNoreturnCFGResult> &cache,
+    RISCVNoreturnEligibilityAudit *audit) {
+  auto finish = [&](bool proven, RISCVNoreturnProofStatus status,
+                    StringRef reason) {
+    if (audit) {
+      audit->calleeProven = proven;
+      audit->functionFallthroughSuppressed = proven;
+      audit->eligibilityChanged = proven;
+      audit->proofStatus = status;
+      audit->proofReason = reason.str();
+    }
+    return proven;
+  };
+
+  if (pairStart < range.begin || pairStart + 8 != range.end)
+    return finish(false, RISCVNoreturnProofStatus::NotProven,
+                  "call-pair-not-at-range-end");
+  if (pairStart + 8 > sec.content().size())
+    return finish(false, RISCVNoreturnProofStatus::TargetRangeUnavailable,
+                  "call-pair-out-of-section");
+
+  ArrayRef<uint8_t> data = sec.content();
+  uint32_t auipc = llvm::support::endian::read32le(data.data() + pairStart);
+  uint32_t jalr = llvm::support::endian::read32le(data.data() + pairStart + 4);
+  uint32_t auipcRd = bits(auipc, 11, 7);
+  uint32_t jalrRd = bits(jalr, 11, 7);
+  uint32_t jalrRs1 = bits(jalr, 19, 15);
+  bool fullPair = (auipc & 0x7f) == 0x17 && auipcRd != 0 &&
+                  (jalr & 0x7f) == 0x67 && jalrRs1 == auipcRd &&
+                  (jalrRd == 0 || jalrRd == 1);
+  if (audit)
+    audit->fullCallPair = fullPair;
+  if (!fullPair)
+    return finish(false, RISCVNoreturnProofStatus::NotProven,
+                  "not-complete-call-pair");
+  if (jalrRd == 0)
+    return finish(false, RISCVNoreturnProofStatus::NotProven,
+                  "tail-call-not-fallthrough");
+
+  Symbol *target = nullptr;
+  bool sawCallReloc = false;
+  bool sawSymbolZero = false;
+  bool ambiguous = false;
+  int64_t callAddend = 0;
+  for (const RelTy &rel : rels) {
+    RelType type = rel.getType(config->isMips64EL);
+    if (rel.r_offset != pairStart ||
+        (type != R_RISCV_CALL && type != R_RISCV_CALL_PLT))
+      continue;
+    if (sawCallReloc) {
+      ambiguous = true;
+      continue;
+    }
+    sawCallReloc = true;
+    callAddend = getRISCVFunctionSplitAddend(rel);
+    if (audit)
+      audit->callAddend = callAddend;
+    if (rel.getSymbol(config->isMips64EL) == 0) {
+      sawSymbolZero = true;
+      continue;
+    }
+    target = &sec.getFile<ELFT>()->getRelocTargetSym(rel);
+  }
+  if (ambiguous)
+    return finish(false, RISCVNoreturnProofStatus::NoTargetRelocation,
+                  "ambiguous-call-relocation");
+  if (!sawCallReloc)
+    return finish(false, RISCVNoreturnProofStatus::NoTargetRelocation,
+                  "no-call-relocation");
+  if (sawSymbolZero)
+    return finish(false, RISCVNoreturnProofStatus::SymbolIndexZero,
+                  "call-relocation-symbol-index-zero");
+  if (!target)
+    return finish(false, RISCVNoreturnProofStatus::NoTargetRelocation,
+                  "missing-call-target");
+  if (audit)
+    audit->calleeName = toString(*target);
+  if (callAddend != 0)
+    return finish(false, RISCVNoreturnProofStatus::NotProven,
+                  "nonzero-call-addend");
+
+  if (target->isUndefined())
+    return finish(false, RISCVNoreturnProofStatus::UndefinedTarget,
+                  target->isWeak() ? "weak-undefined-target"
+                                   : "undefined-target");
+  if (target->isShared())
+    return finish(false, RISCVNoreturnProofStatus::SharedTarget,
+                  "shared-target");
+  if (target->isLazy())
+    return finish(false, RISCVNoreturnProofStatus::LazyTarget, "lazy-target");
+  if (target->isPreemptible)
+    return finish(false, RISCVNoreturnProofStatus::PreemptibleTarget,
+                  "preemptible-target");
+  auto *d = dyn_cast<Defined>(target);
+  if (!d || !d->isFunc())
+    return finish(false, RISCVNoreturnProofStatus::NonFunctionTarget,
+                  "non-function-target");
+  if (!isa<InputSection>(d->section) || d->size == 0 ||
+      d->size > std::numeric_limits<uint64_t>::max() - d->value ||
+      d->value + d->size >
+          cast<InputSection>(d->section)->content().size())
+    return finish(false, RISCVNoreturnProofStatus::TargetRangeUnavailable,
+                  "target-range-unavailable");
+
+  DenseSet<Symbol *> stack;
+  RISCVNoreturnCFGResult cfg =
+      proveRISCVNoreturnCFG<ELFT>(target, cache, stack, 0);
+  bool proven =
+      cfg.conservativelyProven &&
+      cfg.status == RISCVNoreturnProofStatus::ConservativelyProven;
+  return finish(proven, cfg.status, cfg.reason);
+}
+
 template <class RelTy>
 static void recordIncomingRelocAudit(InputSection &parent,
                                      ArrayRef<RISCVFunctionRange> ranges,
@@ -4378,6 +4513,7 @@ static void auditSourceRelocs(InputSection &sec,
                               RISCVFunctionSplitAuditResult &result) {
   DenseMap<uint64_t, SmallVector<RelType, 0>> typesAtOffset;
   DenseMap<uint64_t, SmallVector<std::string, 0>> relocDescriptionsAtOffset;
+  DenseMap<Symbol *, RISCVNoreturnCFGResult> noreturnCFGCache;
   const bool collectFallthroughAudit = config->printRISCVFunctionSectionsSplit;
   for (const RelTy &rel : rels) {
     ++result.sourceRelocationCount;
@@ -4397,10 +4533,7 @@ static void auditSourceRelocs(InputSection &sec,
   }
 
   SmallVector<std::string, 0> functionNames;
-  std::optional<DenseMap<Symbol *, RISCVNoreturnCFGResult>>
-      noreturnCFGCache;
   if (collectFallthroughAudit) {
-    noreturnCFGCache.emplace();
     functionNames.resize(ranges.size(), "<none>");
     auto *file = cast<ObjFile<ELFT>>(sec.file);
     for (Symbol *sym : file->getSymbols()) {
@@ -4880,7 +5013,7 @@ static void auditSourceRelocs(InputSection &sec,
         fillTargetSymbol(audit, *target);
         DenseSet<Symbol *> stack;
         audit.cfg = proveRISCVNoreturnCFG<ELFT>(
-            target, *noreturnCFGCache, stack, 0);
+            target, noreturnCFGCache, stack, 0);
         setProofStatus(audit);
         appendNoreturnChain(audit, target);
       } else if (sawSymbolZero) {
@@ -5040,11 +5173,29 @@ static void auditSourceRelocs(InputSection &sec,
             }
           }
           if (!terminal && off + 8 == r.end) {
-            addReason(result,
-                      RISCVFunctionSplitBlockReason::FunctionFallthrough);
+            std::optional<RISCVNoreturnEligibilityAudit> eligibilityAudit;
+            if (collectFallthroughAudit) {
+              eligibilityAudit.emplace();
+              eligibilityAudit->objectFile = toString(sec.file);
+              eligibilityAudit->parentSection = sec.name.str();
+              eligibilityAudit->callerName = functionNames[rangeNo];
+              eligibilityAudit->callerRangeBegin = r.begin;
+              eligibilityAudit->callerRangeEnd = r.end;
+              eligibilityAudit->pairStartOffset = off;
+            }
+            bool provenNoreturn = checkRISCVProvenNoreturnTerminalCall<ELFT>(
+                sec, rels, r, off, noreturnCFGCache,
+                eligibilityAudit ? &*eligibilityAudit : nullptr);
+            if (!provenNoreturn)
+              addReason(result,
+                        RISCVFunctionSplitBlockReason::FunctionFallthrough);
+            if (eligibilityAudit)
+              result.noreturnEligibilityAudits.push_back(
+                  std::move(*eligibilityAudit));
             recordNoreturnDirectCall(off, off + 4);
-            recordRangeFallthrough(RISCVFallthroughReason::DirectCallAtEnd,
-                                   false);
+            if (!provenNoreturn)
+              recordRangeFallthrough(RISCVFallthroughReason::DirectCallAtEnd,
+                                     false);
           }
           off += 8;
           continue;
@@ -6039,15 +6190,48 @@ static void printRISCVFunctionSplitNoreturnAudits(
   uint64_t definedTargets = 0, undefinedTargets = 0, sharedTargets = 0;
   uint64_t lazyTargets = 0, preemptibleTargets = 0, nonFunctionTargets = 0;
   uint64_t targetRangeFound = 0, candidateChains = 0;
+  uint64_t relaxedRangeCount = 0, relaxedParentCount = 0;
+  uint64_t relaxedCandidateBytes = 0;
   auto yesNo = [](bool v) -> StringRef { return v ? "yes" : "no"; };
 
   for (const RISCVFunctionSplitAuditResult &r : results) {
-    if (r.noreturnDirectCallAudits.empty())
+    if (r.noreturnDirectCallAudits.empty() &&
+        r.noreturnEligibilityAudits.empty())
       continue;
-    ++affectedParents;
+    if (!r.noreturnDirectCallAudits.empty())
+      ++affectedParents;
     if (r.functionCount > 1)
       ++affectedMultiFunctionParents;
-    affectedParentCandidateBytes += r.candidateFunctionBytes;
+    if (!r.noreturnDirectCallAudits.empty())
+      affectedParentCandidateBytes += r.candidateFunctionBytes;
+    bool parentRelaxed = llvm::any_of(
+        r.noreturnEligibilityAudits,
+        [](const RISCVNoreturnEligibilityAudit &a) {
+          return a.functionFallthroughSuppressed;
+        });
+    if (parentRelaxed) {
+      ++relaxedParentCount;
+      relaxedCandidateBytes += r.candidateFunctionBytes;
+    }
+    for (const RISCVNoreturnEligibilityAudit &a :
+         r.noreturnEligibilityAudits) {
+      if (a.functionFallthroughSuppressed)
+        ++relaxedRangeCount;
+      message(Twine("riscv-function-sections-split: noreturn eligibility: "
+                    "object file ") +
+              a.objectFile + " parent " + a.parentSection + " caller " +
+              a.callerName + " callee " + a.calleeName + " caller range [" +
+              Twine(a.callerRangeBegin) + "," + Twine(a.callerRangeEnd) +
+              ") pair start " + Twine(a.pairStartOffset) +
+              " call addend " + Twine(a.callAddend) +
+              " full call pair " + yesNo(a.fullCallPair) +
+              " callee proven " + yesNo(a.calleeProven) +
+              " function-fallthrough suppressed " +
+              yesNo(a.functionFallthroughSuppressed) +
+              " eligibility changed " + yesNo(a.eligibilityChanged) +
+              " proof status " + noreturnProofStatusToString(a.proofStatus) +
+              " proof reason " + a.proofReason);
+    }
     for (const RISCVNoreturnDirectCallAudit &a :
          r.noreturnDirectCallAudits) {
       ++auditCount;
@@ -6223,6 +6407,15 @@ static void printRISCVFunctionSplitNoreturnAudits(
           Twine(auditCount -
                 statusCounts[static_cast<size_t>(
                     RISCVNoreturnProofStatus::ConservativelyProven)]));
+  message(Twine("riscv-function-sections-split: noreturn summary: "
+                "noreturn eligibility relaxed range count: ") +
+          Twine(relaxedRangeCount));
+  message(Twine("riscv-function-sections-split: noreturn summary: "
+                "noreturn eligibility relaxed parent count: ") +
+          Twine(relaxedParentCount));
+  message(Twine("riscv-function-sections-split: noreturn summary: "
+                "noreturn eligibility relaxed candidate bytes: ") +
+          Twine(relaxedCandidateBytes));
   SmallVector<std::pair<std::string, uint64_t>, 0> reasons;
   for (const auto &it : proofReasonCounts)
     reasons.push_back({it.getKey().str(), it.getValue()});
