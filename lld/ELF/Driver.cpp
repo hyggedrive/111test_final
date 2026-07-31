@@ -1797,6 +1797,9 @@ static void setConfigs(opt::InputArgList &args) {
   // RV32 下，用户未明确指定时默认开启 GP relaxation。
   if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
     config->relaxGP = isRISCV32;
+
+  if (!args.hasArg(OPT_riscv_relax_jal_rvc, OPT_no_riscv_relax_jal_rvc))
+    config->riscvRelaxJalRVC = isRISCV32;
   
   // RV32 下，用户未明确指定 ICF 时默认使用 safe。
   if (isRISCV32 &&
