@@ -1381,7 +1381,8 @@ static void readConfigs(opt::InputArgList &args) {
       args.hasFlag(OPT_riscv_relax_jal_rvc,
                    OPT_no_riscv_relax_jal_rvc, false);
   config->riscvFunctionSectionsSplitDebugRelocs =
-      args.hasArg(OPT_riscv_function_sections_split_debug_relocs);
+      args.hasFlag(OPT_riscv_function_sections_split_debug_relocs,
+                   OPT_no_riscv_function_sections_split_debug_relocs, false);
   config->riscvFunctionSectionsSplitICF =
       args.hasFlag(OPT_riscv_function_sections_split_icf,
                    OPT_no_riscv_function_sections_split_icf, false);
@@ -1800,6 +1801,14 @@ static void setConfigs(opt::InputArgList &args) {
 
   if (!args.hasArg(OPT_riscv_relax_jal_rvc, OPT_no_riscv_relax_jal_rvc))
     config->riscvRelaxJalRVC = isRISCV32;
+
+  if (!args.hasArg(OPT_riscv_function_sections_split_debug_relocs,
+                   OPT_no_riscv_function_sections_split_debug_relocs))
+    config->riscvFunctionSectionsSplitDebugRelocs = isRISCV32;
+
+  if (!args.hasArg(OPT_riscv_function_sections_split_icf,
+                   OPT_no_riscv_function_sections_split_icf))
+    config->riscvFunctionSectionsSplitICF = isRISCV32;
   
   // RV32 下，用户未明确指定 ICF 时默认使用 safe。
   if (isRISCV32 &&
